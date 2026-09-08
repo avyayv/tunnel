@@ -1,0 +1,33 @@
+# One per machine, shared by every tunneled stack; `tunnel up` starts it and drops a site file
+# per stack into the sites directory.
+#
+# caddy answers http://<name>.<TUNNEL_DOMAIN> on TUNNEL_PROXY_PORT (80 unless the Docker runtime
+# reserves it, as OrbStack does for its own domains) and forwards each host to that stack's port
+# on the host. dns answers every name under the domain with TUNNEL_PROXY_IP so the domain never
+# needs public records: point the tailnet's split DNS for the domain at this machine.
+name: tunnel-proxy
+
+services:
+  caddy:
+    image: caddy:2.10.2
+    ports:
+      - "${TUNNEL_PROXY_BIND:-0.0.0.0}:${TUNNEL_PROXY_PORT:-80}:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${TUNNEL_PROXY_SITES}:/etc/caddy/sites:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  dns:
+    image: coredns/coredns:1.13.1
+    command: ["-conf", "/etc/coredns/Corefile"]
+    environment:
+      TUNNEL_DOMAIN: ${TUNNEL_DOMAIN}
+      TUNNEL_PROXY_IP: ${TUNNEL_PROXY_IP}
+    ports:
+      - "${TUNNEL_PROXY_BIND:-0.0.0.0}:53:53/udp"
+      - "${TUNNEL_PROXY_BIND:-0.0.0.0}:53:53/tcp"
+    volumes:
+      - ./Corefile:/etc/coredns/Corefile:ro
+    restart: unless-stopped
