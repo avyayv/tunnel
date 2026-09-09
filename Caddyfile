@@ -4,9 +4,9 @@
 	auto_https off
 }
 
-# One file per running stack, written by `self-bench up` and removed by `self-bench down`.
+# One file per registered app, written by `tunnel up` and removed by `tunnel down`.
 import /etc/caddy/sites/*.caddy
 
 http:// {
-	respond "selfbench dev proxy: no stack is registered for this host" 404
+	respond "tunnel: no app is registered for this host" 404
 }

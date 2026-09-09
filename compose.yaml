@@ -1,17 +1,17 @@
-# One per machine, shared by every tunneled stack; `tunnel up` starts it and drops a site file
-# per stack into the sites directory.
-#
-# caddy answers http://<name>.<TUNNEL_DOMAIN> on TUNNEL_PROXY_PORT (80 unless the Docker runtime
-# reserves it, as OrbStack does for its own domains) and forwards each host to that stack's port
-# on the host. dns answers every name under the domain with TUNNEL_PROXY_IP so the domain never
-# needs public records: point the tailnet's split DNS for the domain at this machine.
+# Shared HTTP proxy. CoreDNS is optional: only started for split-DNS mode.
+# External DNS (including the default nip.io domain) needs no port 53 listener.
 name: tunnel-proxy
 
 services:
   caddy:
     image: caddy:2.10.2
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2019/config/"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
     ports:
-      - "${TUNNEL_PROXY_BIND:-0.0.0.0}:${TUNNEL_PROXY_PORT:-80}:80"
+      - "${TUNNEL_PROXY_BIND:-0.0.0.0}:${TUNNEL_PROXY_PORT:-8000}:80"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - ${TUNNEL_PROXY_SITES}:/etc/caddy/sites:ro
@@ -20,6 +20,7 @@ services:
     restart: unless-stopped
 
   dns:
+    profiles: [split-dns]
     image: coredns/coredns:1.13.1
     command: ["-conf", "/etc/coredns/Corefile"]
     environment:
