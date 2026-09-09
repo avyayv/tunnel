@@ -11,10 +11,9 @@ tunnel up --name foo      # pick the subdomain yourself
 tunnel ls                 # everything currently running behind the door
 tunnel down               # in the same directory: kills the stack and its subdomain, instantly
 tunnel down foo           # ...or by name, from anywhere
-tunnel <compose args>     # anything else passes through: logs -f, ps, exec ...
 ```
 
-Every stack is isolated: its own compose project, its own loopback port, its own subdomain.
+Each stack gets its own Compose project and subdomain. Host port bindings come from your Compose file: use loopback bindings and non-conflicting ports. The CLI does not rewrite or allocate host ports.
 
 ## How it works
 
@@ -22,8 +21,8 @@ One shared door per machine, started automatically by `tunnel up`:
 
 - **CoreDNS** answers every name under the domain with the machine's address. Point your
   devices' split DNS for the domain at the machine (e.g. a Tailscale admin console restricted
-  nameserver) — nothing is published to public DNS, so nothing is reachable off the tailnet.
-- **Caddy** (port 80, or `SELFBENCH_DEV_PROXY_PORT`) reads the request's `Host` header and
+  nameserver) — nothing is published to public DNS, this is DNS routing, not access control. The default proxy binds all interfaces; restrict firewall access or set `TUNNEL_PROXY_BIND` to the tailnet IP if tailnet-only access is required.
+- **Caddy** (port 80, or `TUNNEL_PROXY_PORT`) reads the request's `Host` header and
   proxies to the stack's port on loopback. One tiny site file per stack under
   `~/.selfbench/dev-proxy/sites`, written by `up`, deleted by `down`.
 
@@ -31,10 +30,10 @@ Configuration through the environment (all optional):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `SELFBENCH_DEV_DOMAIN` | `stack.avyayv.com` | The subdomain wildcards live under. Use a dedicated subdomain so real records of the parent domain are never shadowed. |
-| `SELFBENCH_DEV_PROXY_IP` | `tailscale ip -4` | The address DNS hands out; the machine's address on the network your browser uses. |
-| `SELFBENCH_DEV_PROXY_PORT` | `8000` | Host port for Caddy (80 is often reserved, e.g. by OrbStack). |
-| `SELFBENCH_CONFIG_DIR` | `~/.selfbench` | Where site files and mappings live. |
+| `TUNNEL_DOMAIN` | `stack.avyayv.com` | The subdomain wildcards live under. Use a dedicated subdomain so real records of the parent domain are never shadowed. |
+| `TUNNEL_PROXY_IP` | `tailscale ip -4` | The address DNS hands out; the machine's address on the network your browser uses. |
+| `TUNNEL_PROXY_PORT` | `8000` | Host port for Caddy (80 is often reserved, e.g. by OrbStack). |
+| `TUNNEL_CONFIG_DIR` | `~/.selfbench` | Where site files and mappings live. |
 
 ## GitHub sign-in (optional)
 
@@ -47,3 +46,9 @@ http://<domain>[:<port>]/auth/github/callback
 ```
 
 Enable wildcard matching on that callback URL in the OAuth app's settings.
+
+## Preview discipline
+
+Use a stable `--name` per worktree. Repeated `up` in the same directory reuses its registered name. Use `up --build` after changing image-built source; registering a hostname does not update old containers. Always use the full URL printed by the command, including its port. This tool manages Compose stacks, not standalone development server processes. Do not replace a stack preview with an unmanaged background server.
+
+Run regression tests with `bun test`. Tests use fake Docker commands and do not start or stop real containers.

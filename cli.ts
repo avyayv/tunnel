@@ -46,7 +46,7 @@ function sh(
   if (child.exitCode !== 0 && !quiet) {
     const error = child.stderr.toString().trim() || out || `${command} exited ${child.exitCode}`;
     console.error(`tunnel: ${error}`);
-    process.exit(1);
+    throw new Error(error);
   }
   return out;
 }
@@ -74,18 +74,39 @@ function mappings(): Mapping[] {
     .map((file) => JSON.parse(readFileSync(join(MAPPINGS_DIR, file), "utf8")) as Mapping);
 }
 
-function origin(): string {
-  return `http://${DOMAIN}${PROXY_PORT === "80" ? "" : `:${PROXY_PORT}`}`;
+function origin(name: string): string {
+  return `http://${name}.${DOMAIN}${PROXY_PORT === "80" ? "" : `:${PROXY_PORT}`}`;
+}
+
+function proxyContainer(): string | undefined {
+  const rows = sh("docker", ["ps", "--filter", "name=caddy", "--filter", "status=running", "--format", "{{json .}}"]);
+  const candidates = rows.split("\n").filter(Boolean).map((row) => JSON.parse(row))
+    .filter((row) => String(row.Ports).includes(`:${PROXY_PORT}->80/tcp`));
+  if (candidates.length > 1) throw new Error("multiple Caddy containers own the proxy port");
+  if (!candidates[0]) return undefined;
+  const name = candidates[0].Names;
+  const mounts = JSON.parse(sh("docker", ["inspect", name, "--format", "{{json .Mounts}}"]));
+  if (!mounts.some((mount: { Source: string; Destination: string }) =>
+    resolve(mount.Source) === resolve(SITES_DIR) && mount.Destination === "/etc/caddy/sites")) {
+    throw new Error("proxy port belongs to a Caddy with a different sites directory");
+  }
+  return name;
+}
+
+function reloadProxy(): void {
+  const caddy = proxyContainer();
+  if (!caddy) throw new Error("the proxy Caddy is not running");
+  sh("docker", ["exec", caddy, "caddy", "reload", "--config", "/etc/caddy/Caddyfile"]);
 }
 
 function ensureProxy(): void {
-  // Any running caddy that publishes the proxy port owns the door — ours or an older name.
-  const ports = sh("docker", ["ps", "--filter", "name=caddy", "--filter", "status=running", "--format", "{{.Ports}}"], { quiet: true });
-  if (ports.split("\n").some((line) => line.includes(`:${PROXY_PORT}->`))) return;
+  if (proxyContainer()) return;
+  mkdirSync(SITES_DIR, { recursive: true });
   const ip =
     process.env.TUNNEL_PROXY_IP?.trim() ||
     sh("tailscale", ["ip", "-4"], { quiet: true }) ||
-    "127.0.0.1";
+    "";
+  if (!ip) throw new Error("set TUNNEL_PROXY_IP: could not discover the tailnet address");
   compose(["--project-name", PROXY_PROJECT, "--file", PROXY_FILE, "up", "-d"], {
     env: {
       ...process.env,
@@ -99,16 +120,19 @@ function ensureProxy(): void {
 
 function registerSite(name: string, port: string): void {
   mkdirSync(SITES_DIR, { recursive: true });
+  const path = join(SITES_DIR, `${name}.caddy`);
+  const previous = existsSync(path) ? readFileSync(path) : undefined;
   writeFileSync(
-    join(SITES_DIR, `${name}.caddy`),
+    path,
     `http://${name}.${DOMAIN} {\n\treverse_proxy host.docker.internal:${port}\n}\n`,
   );
-  const caddy = sh("docker", ["ps", "--filter", "name=caddy", "--filter", "status=running", "--format", "{{.Names}}"], { quiet: true }).split("\n")[0];
-  if (!caddy) {
-    console.error("tunnel: the proxy caddy is not running");
-    process.exit(1);
+  try {
+    reloadProxy();
+  } catch (error) {
+    if (previous) writeFileSync(path, previous);
+    else rmSync(path, { force: true });
+    throw error;
   }
-  sh("docker", ["exec", caddy, "caddy", "reload", "--config", "/etc/caddy/Caddyfile"]);
 }
 
 function publishedPorts(project: string, file: string): string[] {
@@ -138,17 +162,21 @@ async function up(args: string[]): Promise<void> {
     else if (arg === "--build") build = true;
     else if (arg !== undefined) dir = resolve(arg);
   }
-  name = name || randomBytes(3).toString("hex"); // e.g. "9f3ab1"; short, random, disposable
+  name = name || mappings().find((mapping) => mapping.dir === dir)?.name || randomBytes(3).toString("hex"); // e.g. "9f3ab1"; short, random, disposable
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name)) throw new Error("invalid tunnel name");
+  if (port && (!/^\d+$/.test(port) || Number(port) < 1 || Number(port) > 65535)) throw new Error("invalid port");
   const existing = mappings().find((mapping) => mapping.name === name);
   if (existing && existing.dir !== dir) {
     console.error(`tunnel: ${name}.${DOMAIN} already serves ${existing.dir}`);
     process.exit(1);
   }
   const file = composeFileOf(dir);
+  if (!existing && existsSync(join(SITES_DIR, `${name}.caddy`))) throw new Error("hostname already registered outside tunnel; refusing to overwrite");
   const project = `tunnel-${name}`;
 
   compose(["--project-name", project, "--file", file, "up", "-d", ...(build ? ["--build"] : [])]);
   const ports = publishedPorts(project, file);
+  if (port && !ports.includes(port)) throw new Error("requested port is not published by this stack");
   if (port === "" && ports.length !== 1) {
     console.error(
       ports.length === 0
@@ -166,7 +194,7 @@ async function up(args: string[]): Promise<void> {
     join(MAPPINGS_DIR, `${name}.json`),
     `${JSON.stringify({ name, project, dir, port: target }, null, 2)}\n`,
   );
-  console.log(`http://${name}.${DOMAIN} -> ${dir} (port ${target})`);
+  console.log(`${origin(name)} -> ${dir} (port ${target})`);
   console.log(`stop it: tunnel down ${name}`);
 }
 
@@ -178,18 +206,16 @@ function down(args: string[]): void {
     console.error(`tunnel: nothing running for ${target}`);
     process.exit(1);
   }
-  compose(["--project-name", mapping.project, "--file", composeFileOf(mapping.dir), "down"], {
-    quiet: true,
-  });
+  compose(["--project-name", mapping.project, "--file", composeFileOf(mapping.dir), "down"]);
   rmSync(join(SITES_DIR, `${mapping.name}.caddy`), { force: true });
+  reloadProxy();
   rmSync(join(MAPPINGS_DIR, `${mapping.name}.json`), { force: true });
-  if (existsSync(join(PROXY_FILE))) registerSite(mapping.name, mapping.port); // reloads without the site
   console.log(`tunnel: ${mapping.name}.${DOMAIN} stopped`);
 }
 
 function ls(): void {
   for (const mapping of mappings()) {
-    console.log(`${mapping.name}.${DOMAIN}\t${mapping.dir} (port ${mapping.port})`);
+    console.log(`${origin(mapping.name)}\t${mapping.dir} (port ${mapping.port})`);
   }
 }
 
