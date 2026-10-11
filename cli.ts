@@ -1,238 +1,22 @@
 #!/usr/bin/env bun
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { lookup } from "node:dns/promises";
-import { configDir, configFile, savedSettings, settings, validatePort, type Config, type Settings } from "./config";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { configDir, configFile, detectIP, savedSettings, settings, validatePort, type Config, type Settings } from "./config";
+import { compose, projectResources, publishedPort, publishedPorts, removeProject, sh, type Env } from "./docker";
+import { DEFAULT_TTL, installReaper, parseTTL, requireExpirySupport } from "./lease";
+import { ensureProxy, origin, proxyContainer, registerSite, removeSite, sitePath } from "./proxy";
+import { acquireLock, deleteMapping, readMappings, saveMapping, type Mapping } from "./state";
 
-let config: Config;
-let SITES_DIR: string;
-let MAPPINGS_DIR: string;
-const PROXY_PROJECT = `tunnel-proxy-${createHash("sha256").update(configDir).digest("hex").slice(0, 8)}`;
-
-function configure(value = settings()): void {
-  config = value;
-  SITES_DIR = join(config.stateDir, "dev-proxy", "sites");
-  MAPPINGS_DIR = join(config.stateDir, "dev-proxy", "mappings");
-}
-const PROXY_FILE = join(import.meta.dir, "compose.yaml");
 const COMPOSE_FILES = ["compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"];
 
-interface Mapping {
-  readonly name: string;
-  readonly project?: string;
-  readonly dir: string;
-  readonly port: string;
-  readonly mode?: "compose" | "local";
-  readonly url?: string;
-  readonly file?: string;
-}
-
-function sh(
-  command: string,
-  args: string[],
-  { quiet = false, env }: { quiet?: boolean; env?: Record<string, string | undefined> } = {},
-): string {
-  const child = Bun.spawnSync([command, ...args], {
-    stdout: "pipe",
-    stderr: "pipe",
-    env: env ? { ...process.env, ...env } : process.env,
-  });
-  const out = child.stdout.toString().trim();
-  if (child.exitCode !== 0 && !quiet) {
-    const error = child.stderr.toString().trim() || out || `${command} exited ${child.exitCode}`;
-    throw new Error(error);
-  }
-  return out;
-}
-
-function compose(
-  args: readonly string[],
-  { quiet = false, env }: { quiet?: boolean; env?: Record<string, string | undefined> } = {},
-): string {
-  return sh("docker", ["compose", ...args], { quiet, env });
-}
-
-function composeFileOf(dir: string): string {
-  const file = COMPOSE_FILES.map((name) => join(dir, name)).find((path) => existsSync(path));
-  if (!file) {
-    console.error(`tunnel: no compose file in ${dir}`);
-    process.exit(1);
-  }
-  return file;
-}
-
-function mappings(): Mapping[] {
-  if (!existsSync(MAPPINGS_DIR)) return [];
-  return readdirSync(MAPPINGS_DIR)
-    .filter((file) => file.endsWith(".json"))
-    .map((file) => JSON.parse(readFileSync(join(MAPPINGS_DIR, file), "utf8")) as Mapping);
-}
-
-function origin(name: string): string {
-  return `http://${name}.${config.domain}${config.port === "80" ? "" : `:${config.port}`}`;
-}
-
-function proxyContainer(): string | undefined {
-  const rows = sh("docker", ["ps", "--filter", "name=caddy", "--filter", "status=running", "--format", "{{json .}}"]);
-  const candidates = rows.split("\n").filter(Boolean).map((row) => JSON.parse(row))
-    .filter((row) => String(row.Ports).includes(`:${config.port}->80/tcp`));
-  if (candidates.length > 1) throw new Error("multiple Caddy containers own the proxy port");
-  if (!candidates[0]) return undefined;
-  const name = candidates[0].Names;
-  const mounts = JSON.parse(sh("docker", ["inspect", name, "--format", "{{json .Mounts}}"]));
-  if (!mounts.some((mount: { Source: string; Destination: string }) =>
-    resolve(mount.Source) === resolve(SITES_DIR) && mount.Destination === "/etc/caddy/sites")) {
-    throw new Error("proxy port belongs to a Caddy with a different sites directory");
-  }
-  return name;
-}
-
-function reloadProxy(): void {
-  const caddy = proxyContainer();
-  if (!caddy) throw new Error("the proxy Caddy is not running");
-  sh("docker", ["exec", caddy, "caddy", "reload", "--config", "/etc/caddy/Caddyfile"]);
-}
-
-function ensureProxy(): void {
-  if (proxyContainer()) return;
-  mkdirSync(SITES_DIR, { recursive: true });
-  compose(["--project-name", PROXY_PROJECT, "--file", PROXY_FILE, "up", "-d", "--wait", "--wait-timeout", "45", "caddy",
-    ...(config.dns === "split" ? ["dns"] : [])], {
-    env: {
-      TUNNEL_DOMAIN: config.domain,
-      TUNNEL_PROXY_IP: config.ip,
-      TUNNEL_PROXY_PORT: config.port,
-      TUNNEL_PROXY_BIND: config.bind,
-      TUNNEL_PROXY_SITES: SITES_DIR,
-    },
-  });
-}
-
-function registerSite(name: string, port: string): void {
-  mkdirSync(SITES_DIR, { recursive: true });
-  const path = join(SITES_DIR, `${name}.caddy`);
-  const previous = existsSync(path) ? readFileSync(path) : undefined;
-  writeFileSync(
-    path,
-    `http://${name}.${config.domain} {\n\treverse_proxy host.docker.internal:${port}\n}\n`,
-  );
-  try {
-    reloadProxy();
-  } catch (error) {
-    if (previous) writeFileSync(path, previous);
-    else rmSync(path, { force: true });
-    throw error;
-  }
-}
-
-function publishedPorts(project: string, file: string): string[] {
-  const rows = compose(
-    ["--project-name", project, "--file", file, "ps", "--format", "json"],
-  );
-  const ports = new Set<string>();
-  const containers = rows.trim().startsWith("[") ? JSON.parse(rows) : rows.split("\n").filter(Boolean).map((line) => JSON.parse(line));
-  for (const container of containers) {
-    for (const publisher of (container.Publishers ?? []) as { PublishedPort: number }[]) {
-      if (publisher.PublishedPort > 0) ports.add(String(publisher.PublishedPort));
-    }
-  }
-  return [...ports];
-}
-
-async function up(args: string[]): Promise<void> {
-  let name = "";
-  let port = "";
-  let build = false;
-  let local = false;
-  let dir = process.cwd();
-  let hasDir = false;
-  const rest = [...args];
-  while (rest.length > 0) {
-    const arg = rest.shift();
-    if (arg === "--name" || arg === "--port") {
-      const value = rest.shift();
-      if (!value || value.startsWith("--")) throw new Error(`${arg} requires a value`);
-      if (arg === "--name") name = value;
-      else port = value;
-    } else if (arg === "--build") build = true;
-    else if (arg === "--local") local = true;
-    else if (arg?.startsWith("-") || hasDir) throw new Error(`unexpected argument: ${arg}`);
-    else if (arg !== undefined) { dir = resolve(arg); hasDir = true; }
-  }
-  name = name || mappings().find((mapping) => mapping.dir === dir)?.name || randomBytes(3).toString("hex"); // e.g. "9f3ab1"; short, random, disposable
-  if (name.length > 63 || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name)) throw new Error("invalid tunnel name");
-  if (port) validatePort(port);
-  const existing = mappings().find((mapping) => mapping.name === name);
-  if (existing && existing.dir !== dir) {
-    console.error(`tunnel: ${name}.${config.domain} already serves ${existing.dir}`);
-    process.exit(1);
-  }
-  if (!existing && existsSync(join(SITES_DIR, `${name}.caddy`))) throw new Error("hostname already registered outside tunnel; refusing to overwrite");
-  const file = COMPOSE_FILES.map((name) => join(dir, name)).find(existsSync);
-  local = local || (!file && !!port) || existing?.mode === "local";
-  const mode = local ? "local" : "compose";
-  if (existing && (existing.mode || "compose") !== mode) throw new Error("remove the existing tunnel before changing its mode");
-  if (existing?.url && existing.url !== origin(name)) throw new Error("configuration changed; restore it and remove the old tunnel before re-registering");
-  if (local && (build || !port)) throw new Error("local apps require --port and cannot use --build");
-  if (!local && !file) throw new Error("no Compose file found; use --port to route an already-running local app");
-  ensureProxy();
-  let target = port;
-  const project = local ? undefined : `tunnel-${name}`;
-  if (project && file) {
-    compose(["--project-name", project, "--file", file, "up", "-d", ...(build ? ["--build"] : [])]);
-    const ports = publishedPorts(project, file);
-    if (port && !ports.includes(port)) throw new Error("requested port is not published by this stack");
-    if (!port && ports.length !== 1) throw new Error(`expected one published port, found ${ports.length}; select one with --port`);
-    target = port || ports[0]!;
-  }
-  registerSite(name, target);
-  mkdirSync(MAPPINGS_DIR, { recursive: true });
-  writeFileSync(
-    join(MAPPINGS_DIR, `${name}.json`),
-    `${JSON.stringify({ name, project, dir, port: target, mode, url: origin(name), file: local ? undefined : file }, null, 2)}\n`,
-  );
-  console.log(`${origin(name)} -> ${dir} (port ${target})`);
-  console.log(`stop it: tunnel down ${name}`);
-}
-
-function down(args: string[]): void {
-  if (args.length > 1 || args[0]?.startsWith("-")) throw new Error("usage: tunnel down [name|dir]");
-  const target = args[0] ?? process.cwd();
-  const absolute = resolve(target);
-  const all = mappings();
-  const exact = all.find((m) => m.name === target);
-  const candidates = exact ? [exact] : all.filter((m) => m.dir === absolute);
-  if (candidates.length > 1) throw new Error("multiple tunnels serve this directory; specify a name");
-  const mapping = candidates[0];
-  if (!mapping) {
-    console.error(`tunnel: nothing running for ${target}`);
-    process.exit(1);
-  }
-  if (mapping.url && mapping.url !== origin(mapping.name)) throw new Error("configuration changed; restore the original domain and proxy port before removing this tunnel");
-  if (mapping.mode !== "local") {
-    if (!mapping.project) throw new Error("Compose mapping is missing its project");
-    compose(["--project-name", mapping.project, "--file", mapping.file || composeFileOf(mapping.dir), "down"]);
-  }
-  const path = join(SITES_DIR, `${mapping.name}.caddy`);
-  const previous = existsSync(path) ? readFileSync(path) : undefined;
-  rmSync(path, { force: true });
-  try { reloadProxy(); } catch (error) {
-    if (previous) writeFileSync(path, previous);
-    throw error;
-  }
-  rmSync(join(MAPPINGS_DIR, `${mapping.name}.json`), { force: true });
-  console.log(`tunnel: ${mapping.name} removed${mapping.mode === "local" ? " (local app left running)" : ""}`);
-}
-
-function ls(): void {
-  for (const mapping of mappings()) {
-    console.log(`${mapping.url || origin(mapping.name)}\t${mapping.dir} (port ${mapping.port}, ${mapping.mode || "compose"})`);
-  }
-}
-
-const HELP = `usage: tunnel up [--name NAME] [--port PORT] [--build] [--local] [dir]
+const HELP = `usage: tunnel up [--name NAME] [--port PORT | --target SERVICE:PORT] [--build]
+                 [--local] [--ttl 30m|never] [--disposable] [--service SERVICE]
+                 [--profile PROFILE] [--url-env VARIABLE] [dir]
+       tunnel extend NAME [30m|never]
        tunnel down [name|dir]
+       tunnel cleanup
        tunnel ls
        tunnel setup [--ip IPV4] [--domain DOMAIN|auto] [--port PORT]
                     [--bind IPV4] [--dns external|split] [--state-dir DIR]
@@ -240,44 +24,258 @@ const HELP = `usage: tunnel up [--name NAME] [--port PORT] [--build] [--local] [
        tunnel --skill
        tunnel --help
 
+--port selects a published host port. --target SERVICE:PORT resolves the host
+port Compose published for a service's container port after startup.
 Without a Compose file, --port registers an already-running app.
 Use --local to bypass a Compose file. Local apps are never started or stopped.
+New previews expire after 30 minutes (macOS launchd; checked every minute).
+Elsewhere, pass --ttl never and remove previews with tunnel down.
+--disposable deletes Compose volumes on teardown; otherwise data is retained.
+Repeat --service, --profile, or --url-env; URL variables apply before Compose starts.
 setup saves configuration; up starts the shared proxy automatically.
 Requires Bun and running Docker with Compose. No public relay or access control.`;
 
+type FlagKind = "value" | "list" | "switch";
+
+function parseFlags(args: readonly string[], spec: Record<string, FlagKind>) {
+  const flags = new Map<string, string[]>();
+  const positional: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    const kind = spec[arg];
+    if (!kind) {
+      if (arg.startsWith("-")) throw new Error(`unexpected argument: ${arg}`);
+      positional.push(arg);
+    } else if (kind === "switch") {
+      flags.set(arg, []);
+    } else {
+      const value = args[++i];
+      if (value === undefined || value.startsWith("-")) throw new Error(`${arg} requires a value`);
+      if (kind === "value" && flags.has(arg)) throw new Error(`${arg} given twice`);
+      flags.set(arg, [...(flags.get(arg) ?? []), value]);
+    }
+  }
+  return {
+    positional,
+    has: (flag: string) => flags.has(flag),
+    value: (flag: string): string | undefined => flags.get(flag)?.[0],
+    list: (flag: string): string[] => flags.get(flag) ?? [],
+  };
+}
+
+// Names are persisted and re-applied on every up, so stored ones are checked too.
+function checkEnvName(name: string): string {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new Error(`invalid environment variable name: ${name}`);
+  if (["PATH", "HOME"].includes(name) || /^(DOCKER|COMPOSE)_/.test(name)) {
+    throw new Error(`--url-env cannot override ${name}; it controls Docker or the shell`);
+  }
+  return name;
+}
+
+const union = (...lists: (readonly string[] | undefined)[]) => [...new Set(lists.flatMap((list) => list ?? []))];
+
+async function up(config: Config, args: string[]): Promise<void> {
+  const flags = parseFlags(args, {
+    "--name": "value", "--port": "value", "--target": "value", "--ttl": "value",
+    "--build": "switch", "--local": "switch", "--disposable": "switch",
+    "--service": "list", "--profile": "list", "--url-env": "list",
+  });
+  if (flags.positional.length > 1) throw new Error(`unexpected argument: ${flags.positional[1]}`);
+  const dir = resolve(flags.positional[0] ?? process.cwd());
+  const all = readMappings(config);
+  const sameDir = all.filter((mapping) => mapping.dir === dir);
+  if (!flags.has("--name") && sameDir.length > 1) throw new Error("multiple tunnels serve this directory; specify --name");
+  // Repeating up in a directory reuses its name; otherwise a short random one, e.g. "9f3ab1".
+  const name = flags.value("--name") ?? sameDir[0]?.name ?? randomBytes(3).toString("hex");
+  if (name.length > 63 || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name)) throw new Error("invalid tunnel name");
+  const url = origin(config, name);
+  const existing = all.find((mapping) => mapping.name === name);
+  if (existing && existing.dir !== dir) throw new Error(`${name}.${config.domain} already serves ${existing.dir}`);
+  if (!existing && existsSync(sitePath(config, name))) throw new Error("hostname already registered outside tunnel; refusing to overwrite");
+  if (existing?.url && existing.url !== url) throw new Error("configuration changed; restore it and remove the old tunnel before re-registering");
+
+  const port = flags.value("--port");
+  if (port) validatePort(port);
+  const explicitTarget = flags.value("--target");
+  if (explicitTarget) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*:\d+$/.test(explicitTarget)) throw new Error("--target must be SERVICE:CONTAINER_PORT");
+    validatePort(explicitTarget.split(":")[1]!);
+  }
+  if (port && explicitTarget) throw new Error("use either --port or --target, not both");
+  // An explicit --port replaces a remembered target.
+  const target = port ? undefined : explicitTarget ?? existing?.target;
+
+  const file = COMPOSE_FILES.map((candidate) => join(dir, candidate)).find(existsSync);
+  const local = flags.has("--local") || (!file && !!port) || existing?.mode === "local";
+  const mode = local ? "local" : "compose";
+  if (existing && (existing.mode ?? "compose") !== mode) throw new Error("remove the existing tunnel before changing its mode");
+  const disposable = flags.has("--disposable") || !!existing?.disposable;
+  const services = union(existing?.services, flags.list("--service"));
+  const profiles = union(existing?.profiles, flags.list("--profile"));
+  const urlEnv = union(existing?.urlEnv, flags.list("--url-env")).map(checkEnvName);
+  if (local) {
+    if (!port || flags.has("--build")) throw new Error("local apps require --port and cannot use --build");
+    if (target || disposable || services.length || profiles.length || urlEnv.length) throw new Error("Compose options cannot be used with --local");
+  } else if (!file) {
+    throw new Error("no Compose file found; use --port to route an already-running local app");
+  }
+
+  // New previews get the default lease. Repeating `up` renews a lease (never shortening it) but
+  // leaves a preview without expiry alone; --ttl always sets the lease explicitly.
+  const now = Date.now();
+  let expiresAt: number | undefined;
+  if (flags.has("--ttl")) {
+    const ttl = parseTTL(flags.value("--ttl")!);
+    expiresAt = ttl ? now + ttl : undefined;
+  } else if (!existing) {
+    expiresAt = now + DEFAULT_TTL;
+  } else if (existing.expiresAt) {
+    expiresAt = Math.max(existing.expiresAt, now + DEFAULT_TTL);
+  }
+  if (expiresAt) requireExpirySupport();
+
+  const project = local ? undefined : existing?.project ?? `tunnel-${name}`;
+  if (project && !existing) {
+    // Teardown removes everything labeled with the project, so never adopt one tunnel did not
+    // start. Retained volumes are reused, but --disposable would delete them.
+    const found = projectResources(project);
+    if (found.containers.length || found.networks.length || (disposable && found.volumes.length)) {
+      throw new Error(`Docker already has resources for Compose project ${project} that no tunnel owns; inspect them with docker ps -a --filter label=com.docker.compose.project=${project}, or choose another --name`);
+    }
+  }
+
+  // Validation is done; from here on, Docker and launchd change.
+  if (expiresAt) installReaper(config);
+  ensureProxy(config);
+  const mapping: Mapping = { name, dir, port: port ?? "", mode, project, url, expiresAt, disposable, services, profiles, urlEnv, target };
+  // Record a new preview before starting it, so after a crash down or cleanup can still remove it.
+  if (!existing) saveMapping(config, mapping);
+  try {
+    let hostPort = port!;
+    if (!local) {
+      const base = ["--project-name", project!, "--file", file!, ...profiles.flatMap((profile) => ["--profile", profile])];
+      const env: Env = Object.fromEntries(urlEnv.map((key) => [key, url]));
+      compose([...base, "up", "-d", ...(flags.has("--build") ? ["--build"] : []), ...services], env);
+      hostPort = target ? publishedPort(base, target, env) : choosePort(publishedPorts(base, env), port);
+    }
+    registerSite(config, name, hostPort);
+    saveMapping(config, { ...mapping, port: hostPort });
+    console.log(`${url} -> ${dir} (port ${hostPort})`);
+    console.log(`stop it: tunnel down ${name}; ${expiresAt ? `expires in ${Math.round((expiresAt - now) / 60_000)} minutes` : "no expiry"}`);
+  } catch (error) {
+    // A failed restart leaves an existing preview registered as it was.
+    if (!existing) {
+      try { teardown(config, mapping); }
+      catch (rollback) { throw new Error(`${(error as Error).message}; rollback failed: ${(rollback as Error).message}; retry with tunnel down ${name}`); }
+    }
+    throw error;
+  }
+}
+
+function choosePort(ports: string[], requested: string | undefined): string {
+  if (requested) {
+    if (!ports.includes(requested)) throw new Error("requested port is not published by this stack");
+    return requested;
+  }
+  if (ports.length !== 1) throw new Error(`expected one published port, found ${ports.length}; select one with --target SERVICE:PORT or --port`);
+  return ports[0]!;
+}
+
+// Borrowed local apps are never stopped; only their route goes.
+function teardown(config: Config, mapping: Mapping): void {
+  if (mapping.mode !== "local") {
+    if (!mapping.project) throw new Error("Compose mapping is missing its project");
+    removeProject(mapping.project, { volumes: !!mapping.disposable });
+  }
+  removeSite(config, mapping.name);
+  deleteMapping(config, mapping.name);
+}
+
+function down(config: Config, args: string[]): void {
+  if (args.length > 1 || args[0]?.startsWith("-")) throw new Error("usage: tunnel down [name|dir]");
+  const target = args[0] ?? process.cwd();
+  const all = readMappings(config);
+  const exact = all.find((mapping) => mapping.name === target);
+  const candidates = exact ? [exact] : all.filter((mapping) => mapping.dir === resolve(target));
+  if (candidates.length > 1) throw new Error("multiple tunnels serve this directory; specify a name");
+  const mapping = candidates[0];
+  if (!mapping) throw new Error(`nothing running for ${target}`);
+  if (mapping.url && mapping.url !== origin(config, mapping.name)) {
+    throw new Error("configuration changed; restore the original domain and proxy port before removing this tunnel");
+  }
+  teardown(config, mapping);
+  console.log(`tunnel: ${mapping.name} removed${mapping.mode === "local" ? " (local app left running)" : ""}`);
+}
+
+function cleanup(config: Config, args: string[]): void {
+  if (args.length) throw new Error("cleanup takes no arguments");
+  for (const mapping of readMappings(config)) {
+    if (!mapping.expiresAt || mapping.expiresAt > Date.now()) continue;
+    try { down(config, [mapping.name]); }
+    catch (error) {
+      console.error(`tunnel: ${mapping.name} expired but teardown failed; retrying next run: ${(error as Error).message}`);
+      process.exitCode = 1;
+    }
+  }
+}
+
+function extend(config: Config, args: string[]): void {
+  if (!args[0] || args.length > 2) throw new Error("usage: tunnel extend NAME [30m|never]");
+  const mapping = readMappings(config).find((m) => m.name === args[0]);
+  if (!mapping) throw new Error(`unknown tunnel name: ${args[0]}`);
+  const ttl = parseTTL(args[1] ?? "30m");
+  if (ttl) {
+    requireExpirySupport();
+    installReaper(config);
+  }
+  saveMapping(config, { ...mapping, expiresAt: ttl ? Date.now() + ttl : undefined });
+  console.log(`tunnel: ${mapping.name} ${ttl ? `expires in ${ttl / 60_000} minutes` : "will not expire"}`);
+}
+
+function ls(config: Config): void {
+  for (const mapping of readMappings(config)) {
+    const expiry = mapping.expiresAt ? `expires ${new Date(mapping.expiresAt).toISOString()}` : "no expiry";
+    console.log(`${mapping.url || origin(config, mapping.name)}\t${mapping.dir} (port ${mapping.port || "starting"}, ${mapping.mode || "compose"}; ${expiry})`);
+  }
+}
+
 function setup(args: string[]): void {
+  const keys: Record<string, keyof Settings> = { "--ip": "ip", "--domain": "domain", "--port": "port", "--bind": "bind", "--dns": "dns", "--state-dir": "stateDir" };
+  const flags = parseFlags(args, Object.fromEntries(Object.keys(keys).map((flag) => [flag, "value" as const])));
+  if (flags.positional.length) throw new Error(`invalid setup option: ${flags.positional[0]}`);
   const saved = savedSettings();
   const next: Settings = { ...saved };
-  const keys: Record<string, keyof Settings> = { "--ip": "ip", "--domain": "domain", "--port": "port", "--bind": "bind", "--dns": "dns", "--state-dir": "stateDir" };
-  while (args.length) {
-    const arg = args.shift()!;
-    const key = keys[arg];
-    const value = args.shift();
-    if (!key || !value || value.startsWith("--")) throw new Error(`invalid setup option: ${arg}`);
+  for (const [flag, key] of Object.entries(keys)) {
+    const value = flags.value(flag);
+    if (value === undefined) continue;
     Object.assign(next, { [key]: key === "domain" && value === "auto" ? undefined : key === "stateDir" ? resolve(value) : value });
   }
-  const nextSaved = settings(next, {}); // Validate even values masked by environment overrides.
-  const previousSaved = settings({ ...saved, ip: saved.ip || nextSaved.ip }, {});
-  const resolved = settings(next);
-  configure(resolved);
-  // Never silently rewrite active routes when changing persistent configuration.
-  const oldState = settings({ ...saved, ip: saved.ip || resolved.ip });
-  const oldMappings = join(oldState.stateDir, "dev-proxy", "mappings");
-  if (existsSync(oldMappings) && readdirSync(oldMappings).some((name) => name.endsWith(".json")) &&
-      ["domain", "ip", "port", "bind", "dns", "stateDir"].some((key) =>
-        oldState[key as keyof Config] !== resolved[key as keyof Config] ||
-        previousSaved[key as keyof Config] !== nextSaved[key as keyof Config])) {
-    throw new Error("active mappings exist; remove them with the old configuration before changing setup");
-  }
-  mkdirSync(configDir, { recursive: true });
-  writeFileSync(configFile, `${JSON.stringify(next, null, 2)}\n`);
-  console.log(`Saved ${configFile}\nURLs: ${origin("app")}\nBind: ${resolved.bind}:${resolved.port}; DNS: ${resolved.dns}`);
+  // Detect the address at most once, so before/after comparisons cannot differ by detection alone.
+  // When detection is ambiguous, `--ip` is how the user resolves it, so fall back to that.
+  let detected: string | undefined;
+  const detect = () => { try { return detectIP(); } catch { return next.ip; } };
+  const withIP = (value: Settings): Settings => value.ip ? value : { ...value, ip: (detected ??= detect()) };
+  const before = { effective: settings(withIP(saved)), saved: settings(withIP(saved), {}) };
+  // Saved values are validated even when the environment masks them.
+  const after = { effective: settings(withIP(next)), saved: settings(withIP(next), {}) };
+  const release = acquireLock(before.effective.stateDir, { wait: true })!;
+  try {
+    // Never silently rewrite active routes when changing persistent configuration.
+    const changed = (a: Config, b: Config) => (["domain", "ip", "port", "bind", "dns", "stateDir"] as const).some((key) => a[key] !== b[key]);
+    if (readMappings(before.effective).length && (changed(before.effective, after.effective) || changed(before.saved, after.saved))) {
+      throw new Error("active mappings exist; remove them with the old configuration before changing setup");
+    }
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(configFile, `${JSON.stringify(next, null, 2)}\n`);
+  } finally { release(); }
+  const resolved = after.effective;
+  console.log(`Saved ${configFile}\nURLs: ${origin(resolved, "app")}\nBind: ${resolved.bind}:${resolved.port}; DNS: ${resolved.dns}`);
   if (resolved.dns === "split") console.log(`Configure a restricted nameserver for ${resolved.domain} pointing to ${resolved.ip}.`);
   else if (next.domain) console.log(`Configure wildcard DNS for *.${resolved.domain} pointing to ${resolved.ip}.`);
   console.log("Run tunnel up to start the proxy. Docker and Bun must already be installed.");
 }
 
-async function doctor(): Promise<void> {
+async function doctor(config: Config): Promise<void> {
   let failures = 0;
   async function check(label: string, fn: () => unknown | Promise<unknown>) {
     try { const detail = await fn(); console.log(`OK ${label}${detail ? `: ${detail}` : ""}`); }
@@ -285,19 +283,19 @@ async function doctor(): Promise<void> {
   }
   await check("Docker", () => sh("docker", ["info", "--format", "{{.ServerVersion}}"]));
   await check("Compose", () => compose(["version", "--short"]));
-  await check("Proxy", () => { const name = proxyContainer(); if (!name) throw new Error("not running; use tunnel up"); return name; });
+  await check("Proxy", () => { const name = proxyContainer(config); if (!name) throw new Error("not running; use tunnel up"); return name; });
   const host = `tunnel-doctor.${config.domain}`;
   await check("Wildcard DNS", async () => {
     const addresses = await lookup(host, { family: 4, all: true });
     if (!addresses.some((entry) => entry.address === config.ip)) throw new Error(`${host} does not resolve to ${config.ip}`);
     return `${host} -> ${config.ip}`;
   });
-  for (const mapping of mappings()) {
+  for (const mapping of readMappings(config)) {
     await check(mapping.name, async () => {
-      if (mapping.url && mapping.url !== origin(mapping.name)) throw new Error("mapping uses a different domain or proxy port");
-      const site = join(SITES_DIR, `${mapping.name}.caddy`);
+      if (mapping.url && mapping.url !== origin(config, mapping.name)) throw new Error("mapping uses a different domain or proxy port");
+      const site = sitePath(config, mapping.name);
       if (!existsSync(site) || !readFileSync(site, "utf8").includes(`host.docker.internal:${mapping.port}`)) throw new Error("missing or mismatched site file");
-      const response = await fetch(mapping.url || origin(mapping.name), { signal: AbortSignal.timeout(5000), redirect: "manual" });
+      const response = await fetch(mapping.url || origin(config, mapping.name), { signal: AbortSignal.timeout(5000), redirect: "manual" });
       await response.body?.cancel();
       if (response.status >= 400) throw new Error(`HTTP ${response.status} (authenticated apps may require manual verification)`);
       return `HTTP ${response.status}`;
@@ -307,20 +305,29 @@ async function doctor(): Promise<void> {
   if (failures) process.exitCode = 1;
 }
 
-try {
-  const [command, ...args] = process.argv.slice(2);
-  if (command === "--skill") console.log(readFileSync(join(import.meta.dir, "skills/tunnel-preview/SKILL.md"), "utf8"));
-  else if (!command || command === "--help" || command === "help") console.log(HELP);
-  else if (command === "setup") setup(args);
-  else {
-    if (!["up", "down", "ls", "doctor"].includes(command)) throw new Error(`unknown command: ${command}\n${HELP}`);
-    if (["ls", "doctor"].includes(command) && args.length) throw new Error(`${command} takes no arguments`);
-    configure();
-    if (command === "up") await up(args);
-    else if (command === "down") down(args);
-    else if (command === "ls") ls();
-    else await doctor();
+async function main([command, ...args]: string[]): Promise<void> {
+  if (command === "--skill") return console.log(readFileSync(join(import.meta.dir, "skills/tunnel-preview/SKILL.md"), "utf8"));
+  if (!command || command === "--help" || command === "help") return console.log(HELP);
+  if (command === "setup") return setup(args);
+  if (!["up", "down", "ls", "doctor", "cleanup", "extend"].includes(command)) throw new Error(`unknown command: ${command}\n${HELP}`);
+  const config = settings();
+  if (command === "ls" || command === "doctor") {
+    if (args.length) throw new Error(`${command} takes no arguments`);
+    return command === "ls" ? ls(config) : doctor(config);
   }
+  // The launchd job skips a tick while another command runs; people and agents wait their turn.
+  const release = acquireLock(config.stateDir, { wait: command !== "cleanup" });
+  if (!release) return;
+  try {
+    if (command === "up") await up(config, args);
+    else if (command === "down") down(config, args);
+    else if (command === "extend") extend(config, args);
+    else cleanup(config, args);
+  } finally { release(); }
+}
+
+try {
+  await main(process.argv.slice(2));
 } catch (error) {
   console.error(`tunnel: ${(error as Error).message}`);
   process.exitCode = 1;

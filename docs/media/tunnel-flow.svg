@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="360" viewBox="0 0 1120 360" role="img" aria-labelledby="title desc">
+<title id="title">Preview it. Forget it.</title><desc id="desc">Tunnel starts your Compose services, routes a named URL through one shared proxy, and tears down the preview after a thirty-minute lease.</desc>
+<rect width="1120" height="360" fill="#101112"/>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+<text x="40" y="51" fill="#a0a5aa" font-size="13" letter-spacing="3">LOCAL PREVIEWS / WITHOUT THE PILEUP</text>
+<text x="40" y="99" fill="#f1f3f5" font-size="32" font-weight="bold">Preview it. Forget it.</text>
+<g fill="#17191b" stroke="#3c4146"><rect x="40" y="135" width="308" height="145"/><rect x="406" y="135" width="308" height="145"/><rect x="772" y="135" width="308" height="145"/></g>
+<g fill="#67e8c0" font-size="13"><text x="62" y="167">01 / START</text><text x="428" y="167">02 / OPEN</text><text x="794" y="167">03 / EXPIRE</text></g>
+<g fill="#f1f3f5" font-size="19"><text x="62" y="204">tunnel up --build</text><text x="428" y="204">branch.your-domain</text><text x="794" y="204">30 minutes later</text></g>
+<g fill="#a0a5aa" font-size="13"><text x="62" y="241">Your Compose services</text><text x="428" y="241">One shared Caddy proxy</text><text x="794" y="241">Owned stack torn down</text></g>
+<g fill="none" stroke="#67e8c0" stroke-width="2"><path d="M356 207h40m-8-6 8 6-8 6"/><path d="M722 207h40m-8-6 8 6-8 6"/></g>
+<text x="40" y="322" fill="#a0a5aa" font-size="12">LAN / TAILSCALE · NOT A PUBLIC RELAY · KEEP DATA UNLESS EXPLICITLY DISPOSABLE</text>
+</g></svg>
