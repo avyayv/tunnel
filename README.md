@@ -19,7 +19,7 @@
 
 Testing a branch shouldn't leave another stack running forever. Tunnel gives each preview a named URL and a **30-minute lease**. Extend it when you need more time; otherwise its owned Compose stack is torn down automatically.
 
-**Not a public relay.** URLs work only on devices that can reach your machine—such as your LAN or [Tailscale](https://tailscale.com/) network. Tunnel provides no authentication or HTTPS. Automatic expiry currently requires macOS; on other platforms, every `up` must use `--ttl never` and teardown is manual.
+**Not a public relay.** URLs work only on devices that can reach your machine—such as your LAN or [Tailscale](https://tailscale.com/) network. Tunnel provides no authentication or HTTPS. Automatic expiry currently requires macOS; on other platforms, create previews with `--ttl never` and teardown is manual.
 
 ## Quick Start
 
@@ -93,7 +93,7 @@ The app must accept requests from Docker via `host.docker.internal` and allow th
 | `tunnel cleanup` | Tears down expired previews; failures remain for retry |
 | `tunnel down my-branch` | Tears down immediately |
 
-On macOS, `up` installs a user **launchd** job that checks expiry every minute, independently of your terminal or coding agent. Missed cleanup checks run after wake if the laptop sleeps. If Docker is unavailable, the job retries every minute; it does not start Docker itself. Teardown isn't guaranteed at the exact second of expiry. The small cleanup job stays installed between previews.
+On macOS, `up` installs a user **launchd** job that checks expiry every minute, independently of your terminal or coding agent. Missed cleanup checks run after wake if the laptop sleeps. If Docker is unavailable, the job retries every minute; it does not start Docker itself. Teardown isn't guaranteed at the exact second of expiry. The small cleanup job and a snapshot of its runtime stay installed between previews, so deleting the source worktree won't break expiry.
 
 **Data is retained by default.** Containers and networks are removed, but Compose volumes remain. For genuinely throwaway previews:
 
@@ -101,7 +101,7 @@ On macOS, `up` installs a user **launchd** job that checks expiry every minute, 
 tunnel up --name scratch --build --disposable .
 ```
 
-`--disposable` authorizes volume deletion on manual or automatic teardown. Don't use it for data you want to keep. External Compose volumes without the preview's project label aren't deleted; images, build cache, and bind-mounted host data are untouched. Previously registered previews without an expiry remain untouched until you explicitly renew them. Borrowed local servers and the shared proxy remain running.
+`--disposable` authorizes volume deletion on manual or automatic teardown and must be selected when creating the preview, not added later. Don't use it for data you want to keep. Without it, named and anonymous volumes remain and may consume disk. Once a preview is removed, reusing its name is refused if retained resources exist—inspect those resources or choose a new name; tunnel won't silently adopt another checkout's database. External Compose volumes without the preview's project label aren't deleted; images, build cache, and bind-mounted host data are untouched. Previously registered previews without an expiry remain untouched until you explicitly renew them. Borrowed local servers and the shared proxy remain running.
 
 Expiry controls running stacks, **not Docker's global disk cache**. Images and build cache may remain; tunnel doesn't run a blanket system/volume prune or delete unrelated repositories' data.
 

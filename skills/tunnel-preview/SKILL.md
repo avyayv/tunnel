@@ -12,7 +12,7 @@ When asked to run, preview, or share a branch, try the installed `tunnel` comman
 1. Identify the exact source directory and service. Preserve unrelated changes and existing routes. Inspect `tunnel ls` before registering a name.
 2. Choose a stable name per worktree. Let tunnel own the Compose lifecycle rather than starting Compose separately and borrowing it with `--local`:
    ```sh
-   tunnel up --name <repo-or-task> --build --ttl 30m <worktree>
+   tunnel up --name <repo-or-task> --build <worktree>
    ```
    New previews expire after 30 minutes on macOS via launchd. Use `tunnel extend <name> 30m` for more time. Do not opt out with `--ttl never` unless requested. Other platforms require `--ttl never`; report that teardown is manual rather than promising automatic cleanup.
    Start only required services with repeatable `--service` and `--profile` flags. Load the repository's env/secrets through its normal Compose configuration. Set its public/OAuth origin before boot with repeatable `--url-env <VARIABLE>` flags, using the actual variable names the repo consumes. Tunnel injects the final URL; it does not configure OAuth providers.

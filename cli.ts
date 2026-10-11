@@ -88,27 +88,33 @@ async function up(config: Config, args: string[]): Promise<void> {
   // Repeating up in a directory reuses its name; otherwise a short random one, e.g. "9f3ab1".
   const name = flags.value("--name") ?? sameDir[0]?.name ?? randomBytes(3).toString("hex");
   if (name.length > 63 || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name)) throw new Error("invalid tunnel name");
+  // Preview projects are tunnel-<name>; the shared proxy's project is tunnel-proxy-<hash>.
+  if (name === "proxy" || name.startsWith("proxy-")) throw new Error("names starting with proxy are reserved for the shared proxy");
   const url = origin(config, name);
   const existing = all.find((mapping) => mapping.name === name);
   if (existing && existing.dir !== dir) throw new Error(`${name}.${config.domain} already serves ${existing.dir}`);
   if (!existing && existsSync(sitePath(config, name))) throw new Error("hostname already registered outside tunnel; refusing to overwrite");
   if (existing?.url && existing.url !== url) throw new Error("configuration changed; restore it and remove the old tunnel before re-registering");
 
-  const port = flags.value("--port");
-  if (port) validatePort(port);
+  const explicitPort = flags.value("--port");
+  if (explicitPort) validatePort(explicitPort);
   const explicitTarget = flags.value("--target");
   if (explicitTarget) {
     if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*:\d+$/.test(explicitTarget)) throw new Error("--target must be SERVICE:CONTAINER_PORT");
     validatePort(explicitTarget.split(":")[1]!);
   }
-  if (port && explicitTarget) throw new Error("use either --port or --target, not both");
-  // An explicit --port replaces a remembered target.
+  if (explicitPort && explicitTarget) throw new Error("use either --port or --target, not both");
+  // A repeated up keeps the previous selection unless a new --port or --target replaces it.
+  const port = explicitPort ?? (explicitTarget ? undefined : existing?.mode === "local" ? existing.port : existing?.fixedPort);
   const target = port ? undefined : explicitTarget ?? existing?.target;
 
   const file = COMPOSE_FILES.map((candidate) => join(dir, candidate)).find(existsSync);
   const local = flags.has("--local") || (!file && !!port) || existing?.mode === "local";
   const mode = local ? "local" : "compose";
   if (existing && (existing.mode ?? "compose") !== mode) throw new Error("remove the existing tunnel before changing its mode");
+  if (existing && flags.has("--disposable") && !existing.disposable) {
+    throw new Error("--disposable is fixed when a preview is created; remove the preview to change it");
+  }
   const disposable = flags.has("--disposable") || !!existing?.disposable;
   const services = union(existing?.services, flags.list("--service"));
   const profiles = union(existing?.profiles, flags.list("--profile"));
@@ -120,37 +126,43 @@ async function up(config: Config, args: string[]): Promise<void> {
     throw new Error("no Compose file found; use --port to route an already-running local app");
   }
 
-  // New previews get the default lease. Repeating `up` renews a lease (never shortening it) but
-  // leaves a preview without expiry alone; --ttl always sets the lease explicitly.
-  const now = Date.now();
-  let expiresAt: number | undefined;
-  if (flags.has("--ttl")) {
-    const ttl = parseTTL(flags.value("--ttl")!);
-    expiresAt = ttl ? now + ttl : undefined;
-  } else if (!existing) {
-    expiresAt = now + DEFAULT_TTL;
-  } else if (existing.expiresAt) {
-    expiresAt = Math.max(existing.expiresAt, now + DEFAULT_TTL);
-  }
-  if (expiresAt) requireExpirySupport();
+  // New previews get the default lease. Repeating up renews a lease (never shortening it) but
+  // leaves a preview without expiry alone; --ttl always sets the lease explicitly. The lease runs
+  // from when the preview is ready, so a slow build does not eat into it.
+  const ttl = flags.has("--ttl") ? parseTTL(flags.value("--ttl")!) : undefined;
+  const leaseFrom = (now: number) => {
+    if (ttl !== undefined) return ttl ? now + ttl : undefined;
+    if (!existing) return now + DEFAULT_TTL;
+    return existing.expiresAt ? Math.max(existing.expiresAt, now + DEFAULT_TTL) : undefined;
+  };
+  const leased = leaseFrom(Date.now()) !== undefined;
+  if (leased) requireExpirySupport();
 
   const project = local ? undefined : existing?.project ?? `tunnel-${name}`;
   if (project && !existing) {
-    // Teardown removes everything labeled with the project, so never adopt one tunnel did not
-    // start. Retained volumes are reused, but --disposable would delete them.
+    // Teardown removes everything labeled with the project, so never adopt anything already there,
+    // including volumes retained from an earlier preview (inspect or remove those by hand).
     const found = projectResources(project);
-    if (found.containers.length || found.networks.length || (disposable && found.volumes.length)) {
-      throw new Error(`Docker already has resources for Compose project ${project} that no tunnel owns; inspect them with docker ps -a --filter label=com.docker.compose.project=${project}, or choose another --name`);
+    if (found.containers.length || found.networks.length || found.volumes.length) {
+      throw new Error(`Docker already has resources for Compose project ${project} that no preview owns. `
+        + `Inspect them with docker ps -a, docker network ls and docker volume ls using --filter label=com.docker.compose.project=${project}, or choose another --name`);
     }
   }
 
   // Validation is done; from here on, Docker and launchd change.
-  if (expiresAt) installReaper(config);
+  if (leased) installReaperFor(config, all);
   ensureProxy(config);
-  const mapping: Mapping = { name, dir, port: port ?? "", mode, project, url, expiresAt, disposable, services, profiles, urlEnv, target };
+  // A provisional lease, so a crash during startup still expires the half-started preview.
+  const mapping: Mapping = {
+    name, dir, port: port ?? "", mode, project, url, expiresAt: leaseFrom(Date.now()), disposable, services, profiles, urlEnv, target,
+    fixedPort: local ? undefined : port,
+  };
   // Record a new preview before starting it, so after a crash down or cleanup can still remove it.
   if (!existing) saveMapping(config, mapping);
   try {
+    // The prior host port may be reassigned when Compose recreates containers. Stop routing to it
+    // until the current stack's port has been resolved and registered successfully.
+    if (existing) removeSite(config, name);
     let hostPort = port!;
     if (!local) {
       const base = ["--project-name", project!, "--file", file!, ...profiles.flatMap((profile) => ["--profile", profile])];
@@ -159,17 +171,30 @@ async function up(config: Config, args: string[]): Promise<void> {
       hostPort = target ? publishedPort(base, target, env) : choosePort(publishedPorts(base, env), port);
     }
     registerSite(config, name, hostPort);
-    saveMapping(config, { ...mapping, port: hostPort });
+    const ready = Date.now();
+    const expiresAt = leaseFrom(ready);
+    saveMapping(config, { ...mapping, port: hostPort, expiresAt });
     console.log(`${url} -> ${dir} (port ${hostPort})`);
-    console.log(`stop it: tunnel down ${name}; ${expiresAt ? `expires in ${Math.round((expiresAt - now) / 60_000)} minutes` : "no expiry"}`);
+    console.log(`stop it: tunnel down ${name}; ${expiresAt ? `expires in ${Math.round((expiresAt - ready) / 60_000)} minutes` : "no expiry"}`);
   } catch (error) {
-    // A failed restart leaves an existing preview registered as it was.
+    // A failed restart keeps the existing record, unrouted, for a retried up or down.
     if (!existing) {
       try { teardown(config, mapping); }
       catch (rollback) { throw new Error(`${(error as Error).message}; rollback failed: ${(rollback as Error).message}; retry with tunnel down ${name}`); }
     }
     throw error;
   }
+}
+
+// The job tears previews down with the configuration baked in now, so refuse to rewrite it while a
+// leased preview was registered under another one (for example before an IP change).
+function installReaperFor(config: Config, mappings: Mapping[]): void {
+  const stranded = mappings.filter((mapping) => mapping.expiresAt && mapping.url && mapping.url !== origin(config, mapping.name));
+  if (stranded.length) {
+    throw new Error(`leased preview ${stranded[0]!.name} uses ${stranded[0]!.url}, which this configuration cannot remove; `
+      + `restore the configuration it was created with (for example TUNNEL_PROXY_IP) and run tunnel down ${stranded[0]!.name}`);
+  }
+  installReaper(config);
 }
 
 function choosePort(ports: string[], requested: string | undefined): string {
@@ -207,10 +232,10 @@ function down(config: Config, args: string[]): void {
   console.log(`tunnel: ${mapping.name} removed${mapping.mode === "local" ? " (local app left running)" : ""}`);
 }
 
-function cleanup(config: Config, args: string[]): void {
-  if (args.length) throw new Error("cleanup takes no arguments");
-  for (const mapping of readMappings(config)) {
-    if (!mapping.expiresAt || mapping.expiresAt > Date.now()) continue;
+const expired = (mapping: Mapping) => !!mapping.expiresAt && mapping.expiresAt <= Date.now();
+
+function cleanup(config: Config): void {
+  for (const mapping of readMappings(config).filter(expired)) {
     try { down(config, [mapping.name]); }
     catch (error) {
       console.error(`tunnel: ${mapping.name} expired but teardown failed; retrying next run: ${(error as Error).message}`);
@@ -221,12 +246,13 @@ function cleanup(config: Config, args: string[]): void {
 
 function extend(config: Config, args: string[]): void {
   if (!args[0] || args.length > 2) throw new Error("usage: tunnel extend NAME [30m|never]");
-  const mapping = readMappings(config).find((m) => m.name === args[0]);
+  const all = readMappings(config);
+  const mapping = all.find((m) => m.name === args[0]);
   if (!mapping) throw new Error(`unknown tunnel name: ${args[0]}`);
   const ttl = parseTTL(args[1] ?? "30m");
   if (ttl) {
     requireExpirySupport();
-    installReaper(config);
+    installReaperFor(config, [...all, { ...mapping, expiresAt: Date.now() + ttl }]);
   }
   saveMapping(config, { ...mapping, expiresAt: ttl ? Date.now() + ttl : undefined });
   console.log(`tunnel: ${mapping.name} ${ttl ? `expires in ${ttl / 60_000} minutes` : "will not expire"}`);
@@ -258,16 +284,13 @@ function setup(args: string[]): void {
   const before = { effective: settings(withIP(saved)), saved: settings(withIP(saved), {}) };
   // Saved values are validated even when the environment masks them.
   const after = { effective: settings(withIP(next)), saved: settings(withIP(next), {}) };
-  const release = acquireLock(before.effective.stateDir, { wait: true })!;
-  try {
-    // Never silently rewrite active routes when changing persistent configuration.
-    const changed = (a: Config, b: Config) => (["domain", "ip", "port", "bind", "dns", "stateDir"] as const).some((key) => a[key] !== b[key]);
-    if (readMappings(before.effective).length && (changed(before.effective, after.effective) || changed(before.saved, after.saved))) {
-      throw new Error("active mappings exist; remove them with the old configuration before changing setup");
-    }
-    mkdirSync(configDir, { recursive: true });
-    writeFileSync(configFile, `${JSON.stringify(next, null, 2)}\n`);
-  } finally { release(); }
+  // Never silently rewrite active routes when changing persistent configuration.
+  const changed = (a: Config, b: Config) => (["domain", "ip", "port", "bind", "dns", "stateDir"] as const).some((key) => a[key] !== b[key]);
+  if (readMappings(before.effective).length && (changed(before.effective, after.effective) || changed(before.saved, after.saved))) {
+    throw new Error("active mappings exist; remove them with the old configuration before changing setup");
+  }
+  mkdirSync(configDir, { recursive: true });
+  writeFileSync(configFile, `${JSON.stringify(next, null, 2)}\n`);
   const resolved = after.effective;
   console.log(`Saved ${configFile}\nURLs: ${origin(resolved, "app")}\nBind: ${resolved.bind}:${resolved.port}; DNS: ${resolved.dns}`);
   if (resolved.dns === "split") console.log(`Configure a restricted nameserver for ${resolved.domain} pointing to ${resolved.ip}.`);
@@ -306,23 +329,34 @@ async function doctor(config: Config): Promise<void> {
 }
 
 async function main([command, ...args]: string[]): Promise<void> {
-  if (command === "--skill") return console.log(readFileSync(join(import.meta.dir, "skills/tunnel-preview/SKILL.md"), "utf8"));
-  if (!command || command === "--help" || command === "help") return console.log(HELP);
-  if (command === "setup") return setup(args);
-  if (!["up", "down", "ls", "doctor", "cleanup", "extend"].includes(command)) throw new Error(`unknown command: ${command}\n${HELP}`);
-  const config = settings();
+  if (command === "--skill") {
+    console.log(readFileSync(join(import.meta.dir, "skills/tunnel-preview/SKILL.md"), "utf8"));
+    return;
+  }
+  if (!command || command === "--help" || command === "help") {
+    console.log(HELP);
+    return;
+  }
+  if (!["up", "down", "ls", "doctor", "cleanup", "extend", "setup"].includes(command)) throw new Error(`unknown command: ${command}\n${HELP}`);
   if (command === "ls" || command === "doctor") {
     if (args.length) throw new Error(`${command} takes no arguments`);
-    return command === "ls" ? ls(config) : doctor(config);
+    return command === "ls" ? ls(settings()) : doctor(settings());
   }
-  // The launchd job skips a tick while another command runs; people and agents wait their turn.
-  const release = acquireLock(config.stateDir, { wait: command !== "cleanup" });
+  // The launchd job runs `cleanup --scheduled`: it only locks when something has expired, and it
+  // skips (with a log line) a tick while another command runs. Everything else waits its turn.
+  const scheduled = command === "cleanup" && args[0] === "--scheduled";
+  if (command === "cleanup" && args.length > (scheduled ? 1 : 0)) throw new Error("cleanup takes no arguments");
+  if (scheduled && !readMappings(settings()).some(expired)) return;
+  const release = acquireLock({ wait: !scheduled });
   if (!release) return;
   try {
+    // Settings are read under the lock, so a concurrent setup cannot leave this command using stale ones.
+    if (command === "setup") return setup(args);
+    const config = settings();
     if (command === "up") await up(config, args);
     else if (command === "down") down(config, args);
     else if (command === "extend") extend(config, args);
-    else cleanup(config, args);
+    else cleanup(config);
   } finally { release(); }
 }
 

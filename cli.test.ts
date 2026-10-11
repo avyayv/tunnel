@@ -17,7 +17,10 @@ const line = a.join(' ');
 fs.appendFileSync(process.env.LOG, JSON.stringify({ call: 'docker ' + line, url: process.env.APP_PUBLIC_URL }) + '\\n');
 const state = (project, kind) => process.env.LOG + '.' + project + '.' + kind;
 const project = a[0] === 'compose' && a.includes('--project-name') ? a[a.indexOf('--project-name') + 1] : undefined;
-if (project && a.includes('up')) for (const kind of ['c', 'n', 'v']) fs.writeFileSync(state(project, kind), '');
+if (project && a.includes('up')) {
+  for (const kind of ['c', 'n', 'v']) fs.writeFileSync(state(project, kind), '');
+  if (process.env.SLOW_UP) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(process.env.SLOW_UP));
+}
 if (process.env.CRASH && line.includes(process.env.CRASH)) process.kill(process.ppid, 'SIGKILL');
 if (process.env.FAIL && process.env.FAIL.split(',').some((s) => line.includes(s))) { console.error('fake failure: ' + line); process.exit(1); }
 const labeled = (kind) => {
@@ -47,15 +50,31 @@ if (a[0] === 'compose' && a.includes('caddy')) {
 }
 `;
 
-// Fake launchctl: logs calls and remembers whether the job is loaded.
+// Fake launchctl: logs calls and remembers whether the job is loaded. Like launchd, it can keep
+// reporting a booted-out job for BOOTOUT_LAG more prints and fail the first BOOTSTRAP_FAILS
+// bootstraps with EIO.
 const LAUNCHCTL = `
 const fs = require('node:fs');
 const a = process.argv.slice(2);
-const loaded = process.env.LOG + '.loaded';
+const file = (name) => process.env.LOG + '.' + name;
+const count = (name) => fs.existsSync(file(name)) ? Number(fs.readFileSync(file(name), 'utf8')) : 0;
 fs.appendFileSync(process.env.LOG, JSON.stringify({ call: 'launchctl ' + a.join(' ') }) + '\\n');
-if (a[0] === 'print' && !fs.existsSync(loaded)) process.exit(113);
-if (a[0] === 'bootstrap') fs.writeFileSync(loaded, '');
-if (a[0] === 'bootout') fs.rmSync(loaded, { force: true });
+if (a[0] === 'print') {
+  if (count('lag') > 0) { fs.writeFileSync(file('lag'), String(count('lag') - 1)); process.exit(0); }
+  process.exit(fs.existsSync(file('loaded')) ? 0 : 113);
+}
+if (a[0] === 'bootout') {
+  fs.rmSync(file('loaded'), { force: true });
+  fs.writeFileSync(file('lag'), process.env.BOOTOUT_LAG || '0');
+}
+if (a[0] === 'bootstrap') {
+  if (count('fails') < Number(process.env.BOOTSTRAP_FAILS || 0)) {
+    fs.writeFileSync(file('fails'), String(count('fails') + 1));
+    console.error('Bootstrap failed: 5: Input/output error');
+    process.exit(5);
+  }
+  fs.writeFileSync(file('loaded'), '');
+}
 `;
 
 function fixture() {
@@ -77,7 +96,7 @@ function fixture() {
     TUNNEL_STATE_DIR: "", TUNNEL_PROXY_BIND: "", TUNNEL_DNS: "",
     SITES: sites, LOG: log, MARKER: join(root, "proxy-started"), PROXY_ENV: join(root, "proxy-env"), ...extra,
   });
-  const command = (args: string[]) => [process.execPath, join(import.meta.dir, "cli.ts"), ...args];
+  const command = (args: string[], cli = join(import.meta.dir, "cli.ts")) => [process.execPath, cli, ...args];
   // Off macOS, finite leases are refused, so ordinary cases opt out of expiry explicitly.
   const portable = (args: string[]) => !darwin && args[0] === "up" && !args.includes("--ttl") ? [...args, "--ttl", "never"] : args;
   const mappingPath = join(config, "dev-proxy/mappings/review.json");
@@ -88,6 +107,7 @@ function fixture() {
     lock: join(config, "tunnel.lock"),
     runRaw: (args: string[], extra: Record<string, string> = {}) => Bun.spawnSync(command(args), { cwd: app, env: env(extra) }),
     run: (args: string[], extra: Record<string, string> = {}) => Bun.spawnSync(command(portable(args)), { cwd: app, env: env(extra) }),
+    runCli: (cli: string, args: string[]) => Bun.spawnSync(command(args, cli), { cwd: app, env: env({}) }),
     spawn: (args: string[]) => Bun.spawn(command(portable(args)), { cwd: app, env: env({}), stdout: "pipe", stderr: "pipe" }),
     calls: (): string[] => rows().map((row) => row.call),
     urlFor: (prefix: string): string | undefined => rows().find((row) => row.call.startsWith(prefix))?.url,
@@ -142,8 +162,9 @@ test("Compose preview routes its published port, reuses its name, and retains vo
   expect(f.docker("tunnel-review", "v")).toBe(true);
   expect(existsSync(f.route)).toBe(false);
   expect(existsSync(f.mappingPath)).toBe(false);
-  // The retained data belongs to this name and is reused by its next preview.
-  success(f.run(["up", "--name", "review"]));
+  // Retained data is never adopted by a later preview; only manual inspection reaches it.
+  expect(failure(f.run(["up", "--name", "review"]))).toContain("docker volume ls");
+  expect(f.docker("tunnel-review", "v")).toBe(true);
 }));
 
 test("--target resolves an ephemeral host port after startup and is re-resolved on repeat up", withFixture((f) => {
@@ -179,24 +200,51 @@ for (const [label, args, env] of [
 
 test("new preview refuses a Compose project that tunnel did not start", withFixture((f) => {
   f.seedDocker("tunnel-review", "c");
-  expect(failure(f.run(["up", "--name", "review"]))).toContain("no tunnel owns");
+  expect(failure(f.run(["up", "--name", "review"]))).toContain("no preview owns");
   expect(f.calls().some((call) => call.includes(" up ") || call.startsWith("docker stop"))).toBe(false);
   expect(f.docker("tunnel-review", "c")).toBe(true);
 
-  // Volumes alone are retained data: reused normally, but never handed to --disposable.
   rmSync(`${join(f.root, "log")}.tunnel-review.c`);
   f.seedDocker("tunnel-review", "v");
+  failure(f.run(["up", "--name", "review"]));
   failure(f.run(["up", "--name", "review", "--disposable"]));
   expect(f.docker("tunnel-review", "v")).toBe(true);
-  success(f.run(["up", "--name", "review"]));
+  expect(existsSync(f.mappingPath)).toBe(false);
 }));
 
-test("failed restart keeps the existing preview registered as it was", withFixture((f) => {
+test("a preview's volume policy is fixed when it is created", withFixture((f) => {
+  success(f.run(["up", "--name", "review"]));
+  expect(failure(f.run(["up", "--disposable"]))).toContain("--disposable is fixed");
+  expect(f.mapping().disposable).toBe(false);
+  success(f.run(["down", "review"]));
+  expect(f.docker("tunnel-review", "v")).toBe(true);
+}));
+
+test("repeat up keeps a --port selection until --target replaces it", withFixture((f) => {
+  const env = { PORTS: "8123,9000" };
+  success(f.run(["up", "--name", "review", "--port", "9000"], env));
+  success(f.run(["up"], env));
+  expect(readFileSync(f.route, "utf8")).toContain("host.docker.internal:9000");
+  success(f.run(["up", "--target", "api:8080"], env));
+  success(f.run(["up"], { ...env, TARGET_PORT: "55002" }));
+  expect(readFileSync(f.route, "utf8")).toContain("host.docker.internal:55002");
+}));
+
+test("repeat up of a borrowed local app reuses its port", withFixture((f) => {
+  success(f.run(["up", "--local", "--port", "5191", "--name", "review"]));
+  success(f.run(["up"]));
+  expect(readFileSync(f.route, "utf8")).toContain("host.docker.internal:5191");
+}));
+
+test("failed restart keeps the record but stops routing to a possibly reassigned port", withFixture((f) => {
   success(f.run(["up", "--name", "review", "--port", "8123"], { PORTS: "8123,9000" }));
   failure(f.run(["up", "--port", "9000"], { PORTS: "8123,9000", FAIL: "caddy reload" }));
   expect(readFileSync(f.route, "utf8")).toContain("host.docker.internal:8123");
   expect(f.mapping().port).toBe("8123");
   expect(f.docker("tunnel-review", "c")).toBe(true);
+  failure(f.run(["up", "--port", "9000"], { PORTS: "8123,9000", FAIL: "up -d" }));
+  expect(existsSync(f.route)).toBe(false);
+  expect(f.mapping().port).toBe("8123");
 }));
 
 test("failed rollback keeps the mapping so down can finish later", withFixture((f) => {
@@ -339,8 +387,8 @@ test("invalid input is rejected without Docker or launchd side effects", withFix
     ["up", "--target", "api"], ["up", "--target", "api:http"], ["up", "--target", "api:0"], ["up", "--target", "api:65536"],
     ["up", "--port", "8123", "--target", "api:8080"], ["up", "--local", "--port", "5191", "--target", "api:8080"],
     ["up", "--local", "--port", "5191", "--profile", "x"], ["up", "--local"], ["up", "--local", "--port", "80", "--build"],
-    ["up", "--unknown"], ["up", "one", "two"],
-    ["extend"], ["extend", "missing"], ["down", "missing"], ["cleanup", "extra"], ["ls", "extra"],
+    ["up", "--unknown"], ["up", "one", "two"], ["up", "--name", "proxy"], ["up", "--name", "proxy-1a2b3c4d"],
+    ["extend"], ["extend", "missing"], ["down", "missing"], ["cleanup", "extra"], ["cleanup", "--scheduled", "extra"], ["ls", "extra"],
     ["setup", "--ip", "bad"], ["setup", "--dns", "bad"], ["setup", "--bind", "bad"],
     ["setup", "--domain", "bad\n{evil}"], ["setup", "--port", "zero"], ["setup", "--wat", "x"],
   ]) {
@@ -369,38 +417,93 @@ test("a directory with several previews requires an explicit name", withFixture(
   success(f.run(["down", "review"]));
 }));
 
-test("cleanup skips a tick while another live operation holds the lock; commands wait for it", withFixture(async (f) => {
+test("scheduled cleanup logs and skips a busy tick; manual commands wait for the lock", withFixture(async (f) => {
   success(f.run(["up", "--name", "review"]));
   expire(f);
   mkdirSync(f.lock);
   writeFileSync(join(f.lock, "pid"), String(process.pid)); // The test runner is alive.
-  success(f.run(["cleanup"]));
+  const skipped = f.run(["cleanup", "--scheduled"]);
+  expect(skipped.exitCode).toBe(0);
+  expect(skipped.stderr.toString()).toContain(`skipped; pid ${process.pid} has held ${f.lock}`);
   expect(existsSync(f.mappingPath)).toBe(true);
 
-  const waiting = f.spawn(["down", "review"]);
-  await Bun.sleep(600);
+  const waiting = f.spawn(["cleanup"]);
+  const reader = waiting.stderr.getReader();
+  let stderr = "";
+  while (!stderr.includes("waiting for another tunnel operation")) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    stderr += new TextDecoder().decode(value);
+  }
+  expect(stderr).toContain(`waiting for another tunnel operation (pid ${process.pid})`);
   expect(existsSync(f.mappingPath)).toBe(true);
   rmSync(f.lock, { recursive: true });
   expect(await waiting.exited).toBe(0);
-  expect(await new Response(waiting.stderr).text()).toContain(`waiting for another tunnel operation (pid ${process.pid})`);
   expect(existsSync(f.mappingPath)).toBe(false);
 }));
 
+test("scheduled cleanup does not take the lock when nothing has expired", withFixture((f) => {
+  success(f.run(["up", "--name", "review", "--ttl", "never"]));
+  mkdirSync(f.lock);
+  writeFileSync(join(f.lock, "pid"), String(process.pid));
+  success(f.run(["cleanup", "--scheduled"]));
+}));
+
 macOS("new previews get a 30-minute lease and a launchd reaper under the user's HOME", withFixture((f) => {
-  expect(success(f.run(["up", "--name", "review"]))).toContain("expires in 30 minutes");
+  expect(success(f.run(["up", "--name", "review"], { SECRET_TOKEN: "hunter2" }))).toContain("expires in 30 minutes");
   expect(f.mapping().expiresAt).toBeGreaterThan(Date.now() + 29 * 60_000);
   expect(f.mapping().expiresAt).toBeLessThan(Date.now() + 31 * 60_000);
   const agents = join(f.root, "Library", "LaunchAgents");
   const [plist] = readdirSync(agents);
   expect(plist).toMatch(/^dev\.tunnel\.cleanup\.[0-9a-f]{8}\.plist$/);
   const contents = readFileSync(join(agents, plist!), "utf8");
-  expect(contents).toContain(`<string>${join(import.meta.dir, "cli.ts")}</string><string>cleanup</string>`);
+  expect(contents).not.toContain("hunter2");
   expect(contents).toContain(`<key>TUNNEL_STATE_DIR</key><string>${f.config}</string>`);
   expect(contents).toContain("<key>TUNNEL_DOMAIN</key><string>dev.example.com</string>");
   // An unchanged, loaded job is left alone by later commands.
   success(f.run(["up"]));
   success(f.run(["extend", "review", "1h"]));
   expect(f.calls().filter((call) => call.startsWith("launchctl bootstrap"))).toEqual([`launchctl bootstrap gui/${process.getuid!()} ${join(agents, plist!)}`]);
+}));
+
+macOS("the reaper runs a private copy of tunnel that survives deleting the checkout", withFixture((f) => {
+  success(f.run(["up", "--name", "review"]));
+  const agents = join(f.root, "Library", "LaunchAgents");
+  const contents = readFileSync(join(agents, readdirSync(agents)[0]!), "utf8");
+  const cli = /<string>([^<]+\/cli\.ts)<\/string><string>cleanup<\/string><string>--scheduled<\/string>/.exec(contents)![1]!;
+  expect(cli.startsWith(join(f.config, "runtime"))).toBe(true);
+  expect(readdirSync(join(cli, "..")).sort()).toEqual(["Caddyfile", "Corefile", "cli.ts", "compose.yaml", "config.ts", "docker.ts", "lease.ts", "proxy.ts", "state.ts"]);
+  expire(f);
+  expect(success(f.runCli(cli, ["cleanup", "--scheduled"]))).toContain("review removed");
+  expect(existsSync(f.mappingPath)).toBe(false);
+}));
+
+macOS("rewriting the reaper waits for launchd to unload it and retries a failed bootstrap", withFixture((f) => {
+  success(f.run(["up", "--name", "review"]));
+  const before = f.calls().length;
+  success(f.run(["up"], { TUNNEL_PROXY_BIND: "127.0.0.1", BOOTOUT_LAG: "3", BOOTSTRAP_FAILS: "1" }));
+  const calls = f.calls().slice(before).filter((call) => call.startsWith("launchctl"));
+  const bootout = calls.findIndex((call) => call.startsWith("launchctl bootout"));
+  const bootstraps = calls.flatMap((call, i) => call.startsWith("launchctl bootstrap") ? [i] : []);
+  expect(bootstraps.length).toBe(2);
+  expect(calls.slice(bootout, bootstraps[0]).filter((call) => call.startsWith("launchctl print")).length).toBe(4);
+}));
+
+macOS("a leased preview from another configuration blocks rewriting the reaper", withFixture((f) => {
+  success(f.run(["up", "--name", "review"]));
+  const before = f.calls().length;
+  const changed = { TUNNEL_DOMAIN: "changed.example.com" };
+  expect(failure(f.run(["up", "--name", "another"], changed))).toContain("restore the configuration");
+  failure(f.run(["extend", "review", "1h"], changed));
+  expect(f.calls().slice(before).filter((call) => call.startsWith("launchctl") || call.includes(" up "))).toEqual([]);
+  // Without a lease the reaper is not involved, so the other configuration may still be used.
+  success(f.run(["up", "--name", "another", "--ttl", "never"], changed));
+}));
+
+macOS("the lease starts when the preview is ready, not before a slow build", withFixture((f) => {
+  const started = Date.now();
+  success(f.run(["up", "--name", "review", "--ttl", "1m"], { SLOW_UP: "1500" }));
+  expect(f.mapping().expiresAt).toBeGreaterThanOrEqual(started + 60_000 + 1_500);
 }));
 
 macOS("cleanup tears down only expired previews, deleting volumes only when disposable", withFixture((f) => {

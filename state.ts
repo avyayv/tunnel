@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import type { Config } from "./config";
+import { configDir, type Config } from "./config";
 
 export interface Mapping {
   readonly name: string;
@@ -15,6 +15,7 @@ export interface Mapping {
   readonly profiles?: string[];
   readonly urlEnv?: string[];
   readonly target?: string; // SERVICE:CONTAINER_PORT, re-resolved on every up.
+  readonly fixedPort?: string; // Compose host port chosen with --port, reused by a repeated up.
 }
 
 export const sitesDir = (config: Config) => join(config.stateDir, "dev-proxy", "sites");
@@ -44,13 +45,14 @@ export function writeAtomic(path: string, contents: string): void {
   renameSync(temp, path);
 }
 
-// Serializes commands that change previews so cleanup never races a renewal or startup. The lock
-// is a directory holding the owner's pid, staged and renamed into place so it never appears
-// without an owner. A lock left by a dead process is reported, never taken over automatically.
+// Serializes every command that reads settings and changes previews, so cleanup never races a
+// renewal, startup, or setup. One lock per config directory, because setup may move the state
+// directory. The lock is a directory holding the owner's pid, renamed into place so it never
+// appears without one. A lock left by a dead process is reported, never taken over.
 // Returns the release function, or undefined when `wait` is false and the lock is busy.
-export function acquireLock(stateDir: string, { wait }: { wait: boolean }): (() => void) | undefined {
-  mkdirSync(stateDir, { recursive: true });
-  const path = join(stateDir, "tunnel.lock");
+export function acquireLock({ wait }: { wait: boolean }): (() => void) | undefined {
+  mkdirSync(configDir, { recursive: true });
+  const path = join(configDir, "tunnel.lock");
   const deadline = Date.now() + 10 * 60_000;
   let announced = false;
   for (;;) {
@@ -69,7 +71,13 @@ export function acquireLock(stateDir: string, { wait }: { wait: boolean }): (() 
     if (!isAlive(owner)) {
       throw new Error(`stale lock from pid ${owner}, which is no longer running; if no tunnel command is running, remove ${path}`);
     }
-    if (!wait) return undefined;
+    if (!wait) {
+      // Logged every time, so a lock held far too long (for example by a reused pid) is visible.
+      const since = statSync(path, { throwIfNoEntry: false })?.mtimeMs ?? Date.now();
+      const minutes = Math.round((Date.now() - since) / 60_000);
+      console.error(`tunnel: skipped; pid ${owner} has held ${path} for ${minutes} min`);
+      return undefined;
+    }
     if (Date.now() > deadline) throw new Error(`timed out waiting for tunnel operation (pid ${owner}) holding ${path}`);
     if (!announced) console.error(`tunnel: waiting for another tunnel operation (pid ${owner})`);
     announced = true;
