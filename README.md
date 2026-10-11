@@ -23,7 +23,16 @@ Testing a branch shouldn't leave another stack running forever. Tunnel gives eac
 
 ## Quick Start
 
-Requires [Bun](https://bun.sh/), Git, and running Docker with [Compose v2](https://docs.docker.com/compose/). Clone from source (repository access is required):
+Requires [Bun](https://bun.sh/), Git, and running Docker with [Compose v2](https://docs.docker.com/compose/). Install with the standard GitHub `curl | bash` pattern:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/avyayv/tunnel/main/install.sh | bash
+export PATH="$HOME/.local/bin:$PATH"
+
+tunnel up --name hello ./examples/hello
+```
+
+The installer clones or fast-forward updates the checkout at `~/.local/share/tunnel` and links `~/.local/bin/tunnel` to it. It refuses to overwrite an unrelated install or command. For custom paths, set `TUNNEL_INSTALL_DIR` and/or `TUNNEL_BIN_DIR` before running the installer. Alternatively, install from source manually:
 
 ```sh
 git clone https://github.com/avyayv/tunnel.git
@@ -44,7 +53,7 @@ tunnel extend hello 30m   # Need more time?
 tunnel down hello        # Done already?
 ```
 
-Keep the clone in place: the executable loads supporting files from it. Inspect an existing `~/.local/bin/tunnel` before replacing it. Add the PATH setting to your shell configuration. Update the source checkout with `git pull --ff-only`.
+Keep the checkout in place: the executable loads supporting files from it. The installer refuses to overwrite an existing unrelated `~/.local/bin/tunnel`. Add the PATH setting to your shell configuration. Re-run the installer to update the checkout.
 
 **Exposure:** proxy and example ports bind all interfaces by default. Use a trusted network or configure a local bind and firewall first. DNS names are not access control. See [network setup and limitations](docs/networking.md#configure-your-network).
 
@@ -125,6 +134,17 @@ cp skills/tunnel-preview/SKILL.md ~/.codex/skills/tunnel-preview/SKILL.md
 - [502s, DNS, port conflicts, OAuth, and interrupted commands](docs/networking.md#troubleshoot-and-verify)
 
 `tunnel doctor` checks Docker, Compose, proxy ownership, wildcard DNS, and registered HTTP targets. Authenticated apps may require a manual check. A successful local request doesn't prove another device can reach the URL.
+
+## Uninstall
+
+Stop active previews first with `tunnel ls` and `tunnel down <name>`. Then remove the command link and checkout:
+
+```sh
+rm ~/.local/bin/tunnel
+rm -rf ~/.local/share/tunnel
+```
+
+This does not remove tunnel configuration, retained Compose volumes, or Docker images.
 
 ## Development
 
