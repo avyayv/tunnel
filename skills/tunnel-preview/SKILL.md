@@ -5,21 +5,24 @@ description: Use tunnel to create and verify persistent local web previews from 
 
 # Tunnel Preview
 
-Use the installed `tunnel` command instead of creating another proxy. Run `tunnel --help` and `tunnel --skill` to confirm the installed version's workflow.
+When asked to run, preview, or share a branch, try the installed `tunnel` command first instead of creating another proxy. Run `tunnel --help` and `tunnel --skill` to confirm the installed version's workflow.
 
 ## Required Workflow
 
 1. Identify the exact source directory and service. Preserve unrelated changes and existing routes. Inspect `tunnel ls` before registering a name.
-2. Choose a stable name per worktree. For a Compose app:
+2. Choose a stable name per worktree. Let tunnel own the Compose lifecycle rather than starting Compose separately and borrowing it with `--local`:
    ```sh
    tunnel up --name <repo-or-task> --build <worktree>
    ```
-   If the stack publishes multiple ports, select the intended service's host port with `--port <port>`. Tunnel does not allocate ports or rewrite Compose files.
+   New previews expire after 30 minutes on macOS via launchd. Use `tunnel extend <name> 30m` for more time. Do not opt out with `--ttl never` unless requested. Other platforms require `--ttl never`; report that teardown is manual rather than promising automatic cleanup.
+   Start only required services with repeatable `--service` and `--profile` flags. Load the repository's env/secrets through its normal Compose configuration. Set its public/OAuth origin before boot with repeatable `--url-env <VARIABLE>` flags, using the actual variable names the repo consumes. Tunnel injects the final URL; it does not configure OAuth providers.
+   Volumes are preserved by default. Use `--disposable` only for explicitly throwaway data; this deletes Compose volumes on teardown. Never silently discard user databases/artifacts.
+   For ephemeral ports or multiple published ports, select `--target <service>:<container-port>` so tunnel resolves the assigned host port after startup. Alternatively, select a known host port with `--port <port>`. Tunnel does not allocate ports or rewrite Compose files.
 3. For an already-running local app:
    ```sh
    tunnel up --local --name <repo-or-task> --port <port> <worktree>
    ```
-   Tunnel only registers its route. Start the app with the machine's persistent service mechanism and verify it survives the launching shell. It must be reachable from Docker via `host.docker.internal`. On Linux, loopback-only listeners usually cannot be reached from bridge containers; choose a Docker-reachable bind and protect it with a firewall. Do not weaken network isolation silently.
+   Tunnel only registers its route; expiry does not stop this borrowed server. Prefer owned Compose for automatic full-stack cleanup. Start the app with the machine's persistent service mechanism and verify it survives the launching shell. It must be reachable from Docker via `host.docker.internal`. On Linux, loopback-only listeners usually cannot be reached from bridge containers; choose a Docker-reachable bind and protect it with a firewall. Do not weaken network isolation silently.
 4. Use the complete URL from `tunnel ls` / `tunnel up`, including its port. No domain or IP is universal. Defaults use a detected Tailscale IPv4 address, or one unambiguous private LAN IPv4 address, under `nip.io`. Setup can select a custom domain. Never substitute a guessed localhost link.
 5. Before sharing, verify:
    - the mapping names the intended worktree and port;
@@ -42,4 +45,4 @@ Use the installed `tunnel` command instead of creating another proxy. Run `tunne
 
 ## Reporting
 
-Report the exact preview URL, source/worktree state, and what was verified. Distinguish app HTTP, proxy routing, DNS resolution, and user-network reachability. Never claim remote reachability from a local-only check.
+Report the exact preview URL, source/worktree state, expiry, volume-retention policy, and what was verified. Distinguish app HTTP, proxy routing, DNS resolution, and user-network reachability. Never claim remote reachability from a local-only check.
