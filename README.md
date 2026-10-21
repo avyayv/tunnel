@@ -26,7 +26,7 @@ Tunnel gives each preview a named URL and a **30-minute lease**. Extend it when 
 
 ## Quick Start
 
-Install [Bun](https://bun.sh/), Git, and start Docker with [Compose v2](https://docs.docker.com/compose/). Then install tunnel:
+Install [Bun](https://bun.sh/) and Git, and start Docker with [Compose 2.24 or later](https://docs.docker.com/compose/) (tunnel's generated override files need it). Tested on macOS with OrbStack; Linux is untested. Then install tunnel:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/avyayv/tunnel/main/install.sh | bash
@@ -54,7 +54,7 @@ From any directory containing a Compose file, start a named preview:
 tunnel up --name my-branch --build .
 ```
 
-Tunnel starts the Compose app and reuses one shared Caddy proxy for all previews. Ports pinned in the Compose file (like `8000:8000`) are republished on free host ports, and fixed `container_name`s and volume or network names get per-preview names (external ones stay shared), so several previews of one project can run at once; when a stack publishes several ports, tunnel routes the one that answers HTTP. A `compose.override.yaml` next to the Compose file is loaded as usual. Use a different name for each worktree. Repeat `up` in the same worktree to reuse its name and renew its lease.
+Tunnel starts the Compose app and reuses one shared Caddy proxy for all previews. Without `--port` or `--target`, tunnel sends one GET request to each published port (for up to 30 seconds) to find the one serving HTTP, so your app may see that request. Ports pinned in the Compose file (like `8000:8000`) are republished on free host ports, and fixed `container_name`s and volume or network names get per-preview names (external ones stay shared), so several previews of one project can run at once; when a stack publishes several ports, tunnel routes the one that answers HTTP. A `compose.override.yaml` next to the Compose file is loaded as usual. Use a different name for each worktree. Repeat `up` in the same worktree to reuse its name and renew its lease.
 
 For an app you already started yourself:
 

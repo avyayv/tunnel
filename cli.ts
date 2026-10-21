@@ -38,7 +38,7 @@ Elsewhere, pass --ttl never and remove previews with tunnel down.
 --disposable deletes Compose volumes on teardown; otherwise data is retained.
 Repeat --service, --profile, or --url-env; URL variables apply before Compose starts.
 setup saves configuration; up starts the shared proxy automatically.
-Requires Bun and running Docker with Compose. No public relay or access control.`;
+Requires Bun and running Docker with Compose 2.24 or later. No public relay or access control.`;
 
 type FlagKind = "value" | "list" | "switch";
 
