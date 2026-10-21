@@ -50,7 +50,7 @@ Saved settings live in `~/.config/tunnel/config.json`. Environment values overri
 | `--state-dir` | `TUNNEL_STATE_DIR` | Config directory; holds routes and mappings |
 | — | `TUNNEL_CONFIG_DIR` | `~/.config/tunnel` |
 
-For example, `tunnel setup --bind 100.64.0.10` restricts new proxy listeners to that local interface, not your app's published ports. Some VM-backed runtimes can't bind host VPN interfaces; verify the runtime's behavior and use firewall controls where necessary.
+For example, `tunnel setup --bind 100.64.0.10` restricts new proxy listeners to that local interface. On macOS, ports a Compose preview publishes on all interfaces are rebound to `127.0.0.1` (the proxy still reaches them through `host.docker.internal`), and ports bound to a specific interface are left alone. On Linux, bridge containers can't reach the host's loopback, so app ports keep the Compose file's interfaces; restrict them with firewall rules. Some VM-backed runtimes can't bind host VPN interfaces; verify the runtime's behavior and use firewall controls where necessary.
 
 Older installations used `~/.selfbench` for state. To retain those routes, configure the old domain/IP and `--state-dir ~/.selfbench`. Nothing is migrated or deleted automatically.
 

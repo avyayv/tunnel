@@ -186,19 +186,26 @@ test("--target resolves an ephemeral host port after startup and is re-resolved 
 test("pinned host ports are republished ephemerally and the default override file is loaded", withFixture((f) => {
   writeFileSync(join(f.app, "compose.override.yaml"), "services: {}");
   const config = { services: {
-    web: { ports: [{ mode: "ingress", target: 8000, published: "8000", protocol: "tcp" }] },
+    web: { ports: [
+      { mode: "ingress", target: 8000, published: "8000", protocol: "tcp" },
+      { mode: "ingress", host_ip: "100.64.0.9", target: 9000, protocol: "tcp" },
+    ] },
     worker: {},
   } };
+  // On macOS, ports published on all interfaces also move to loopback; a chosen interface stays.
+  const loopback = darwin ? { host_ip: "127.0.0.1" } : {};
   success(f.run(["up", "--name", "review", "--disposable"], { COMPOSE_CONFIG: JSON.stringify(config) }));
   const ports = join(f.config, "dev-proxy/compose/review.yaml");
-  expect(readFileSync(ports, "utf8")).toBe('services:\n  "web":\n    ports: !override [{"mode":"ingress","target":8000,"protocol":"tcp"}]\n');
+  const republished = [{ mode: "ingress", target: 8000, protocol: "tcp", ...loopback }, config.services.web.ports[1]];
+  expect(readFileSync(ports, "utf8")).toBe(`services:\n  "web":\n    ports: !override ${JSON.stringify(republished)}\n`);
   expect(f.calls()).toContain(`${composeBase(f)} --file ${join(f.app, "compose.override.yaml")} --file ${ports} up -d`);
 
   success(f.run(["down"]));
   expect(existsSync(ports)).toBe(false);
   // --port names a fixed host port, so it keeps the stack's own ports.
   success(f.run(["up", "--name", "review", "--port", "8123"], { COMPOSE_CONFIG: JSON.stringify(config) }));
-  expect(existsSync(ports)).toBe(false);
+  const kept = [{ mode: "ingress", target: 8000, protocol: "tcp", published: "8000", ...loopback }, config.services.web.ports[1]];
+  expect(existsSync(ports) && readFileSync(ports, "utf8")).toBe(darwin && `services:\n  "web":\n    ports: !override ${JSON.stringify(kept)}\n`);
 }));
 
 test("fixed container, volume and network names become project-scoped; external ones stay shared", withFixture((f) => {
@@ -213,7 +220,9 @@ test("fixed container, volume and network names become project-scoped; external 
   };
   success(f.run(["up", "--name", "review", "--port", "8123"], { COMPOSE_CONFIG: JSON.stringify(config), PORTS: "8123" }));
   expect(readFileSync(join(f.config, "dev-proxy/compose/review.yaml"), "utf8")).toBe([
-    "services:", '  "web":', "    container_name: !reset null",
+    "services:", '  "web":',
+    ...darwin ? ['    ports: !override [{"target":80,"protocol":"tcp","published":"80","host_ip":"127.0.0.1"}]'] : [],
+    "    container_name: !reset null",
     "volumes:", '  "data":', "    name: !reset null",
     "networks:", '  "edge":', "    name: !reset null", "",
   ].join("\n"));

@@ -84,7 +84,7 @@ Tunnel selects a Tailscale IPv4 address or an unambiguous private LAN address, a
 - [Configuration flags and environment variables](docs/networking.md#settings)
 - [502s, DNS, port conflicts, OAuth, and interrupted commands](docs/networking.md#troubleshoot-and-verify)
 
-`tunnel doctor` checks Docker, Compose, proxy ownership, wildcard DNS, and registered HTTP targets. A successful local request doesn't prove another device can reach the URL. Proxy and example ports bind all interfaces by default: use a trusted network or configure a local bind and firewall. DNS names are not access control.
+`tunnel doctor` checks Docker, Compose, proxy ownership, wildcard DNS, and registered HTTP targets. A successful local request doesn't prove another device can reach the URL. The proxy binds all interfaces by default: use a trusted network or configure a local bind and firewall. On macOS, Compose previews' own published ports are moved to `127.0.0.1`, so other devices reach apps only through the proxy; on Linux they keep the Compose file's interfaces. DNS names are not access control.
 
 ## Coding Agents
 

@@ -175,7 +175,9 @@ async function up(config: Config, args: string[]): Promise<void> {
       const baseWith = (files: string[]) => ["--project-name", project!, ...files.flatMap((f) => ["--file", f]),
         ...profiles.flatMap((profile) => ["--profile", profile])];
       // A --port selection names a fixed host port, so only then are pinned ports kept.
-      const override = previewOverride(baseWith(files), env, { keepPorts: !!port });
+      // Docker Desktop and OrbStack forward host.docker.internal to the Mac's loopback, so the proxy
+      // still reaches loopback-only apps there; Linux bridge containers cannot.
+      const override = previewOverride(baseWith(files), env, { keepPorts: !!port, loopback: process.platform === "darwin" });
       const path = overridePath(config, name);
       if (override) {
         mkdirSync(dirname(path), { recursive: true });

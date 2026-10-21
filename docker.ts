@@ -34,8 +34,9 @@ export function publishedPorts(base: readonly string[], env: Env): string[] {
 // Previews of one project must not share host ports or names with each other or the proxy. Every
 // pinned port is republished on an ephemeral host port (unless keepPorts), and fixed container,
 // volume and network names fall back to project-prefixed ones; external resources stay shared.
-// Returns a Compose override, or undefined if nothing needs changing.
-export function previewOverride(base: readonly string[], env: Env, { keepPorts }: { keepPorts: boolean }): string | undefined {
+// With loopback, ports published on all interfaces move to 127.0.0.1, so only the proxy is
+// reachable from other devices. Returns a Compose override, or undefined if nothing needs changing.
+export function previewOverride(base: readonly string[], env: Env, { keepPorts, loopback }: { keepPorts: boolean; loopback: boolean }): string | undefined {
   const out = compose([...base, "config", "--format", "json"], env);
   if (!out) return undefined;
   type Port = { target: number; published?: string; protocol?: string; host_ip?: string; app_protocol?: string; mode?: string };
@@ -54,8 +55,14 @@ export function previewOverride(base: readonly string[], env: Env, { keepPorts }
   for (const [name, service] of Object.entries(config.services ?? {})) {
     const fields: string[] = [];
     const ports = service.ports ?? [];
-    if (!keepPorts && ports.some((port) => port.published)) {
-      fields.push(`    ports: !override ${key(ports.map(({ published: _, ...port }) => port))}`);
+    const exposed = (port: Port) => loopback && [undefined, "", "0.0.0.0", "::"].includes(port.host_ip);
+    if (ports.some((port) => (!keepPorts && port.published) || exposed(port))) {
+      const rewritten = ports.map(({ published, ...port }) => ({
+        ...port,
+        ...(keepPorts && published ? { published } : {}),
+        ...(exposed(port) ? { host_ip: "127.0.0.1" } : {}),
+      }));
+      fields.push(`    ports: !override ${key(rewritten)}`);
     }
     if (service.container_name) fields.push("    container_name: !reset null");
     if (fields.length) services.push(`  ${key(name)}:`, ...fields);
