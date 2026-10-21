@@ -1,15 +1,18 @@
 #!/usr/bin/env bun
 import { randomBytes } from "node:crypto";
 import { lookup } from "node:dns/promises";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { configDir, configFile, detectIP, savedSettings, settings, validatePort, type Config, type Settings } from "./config";
-import { compose, projectResources, publishedPort, publishedPorts, removeProject, sh, type Env } from "./docker";
+import { compose, projectResources, publishedPort, publishedPorts, removeProject, sh, unpinnedPorts, type Env } from "./docker";
 import { DEFAULT_TTL, installReaper, parseTTL, requireExpirySupport } from "./lease";
 import { ensureProxy, origin, proxyContainer, registerSite, removeSite, sitePath } from "./proxy";
 import { acquireLock, deleteMapping, readMappings, saveMapping, type Mapping } from "./state";
 
 const COMPOSE_FILES = ["compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"];
+// Compose loads the override next to the default file only when no --file is given, so do it here.
+const overrideFile = (file: string) => file.replace(/\.(ya?ml)$/, ".override.$1");
+const portsOverridePath = (config: Config, name: string) => join(config.stateDir, "dev-proxy", "compose", `${name}.yaml`);
 
 const HELP = `usage: tunnel up [--name NAME] [--port PORT | --target SERVICE:PORT] [--build]
                  [--local] [--ttl 30m|never] [--disposable] [--service SERVICE]
@@ -24,7 +27,9 @@ const HELP = `usage: tunnel up [--name NAME] [--port PORT | --target SERVICE:POR
        tunnel --skill
        tunnel --help
 
---port selects a published host port. --target SERVICE:PORT resolves the host
+Fixed host ports in the Compose file are republished on free ports, so stacks
+never collide; with several, the one answering HTTP is routed.
+--port selects a published host port (and keeps fixed ports). --target SERVICE:PORT resolves the host
 port Compose published for a service's container port after startup.
 Without a Compose file, --port registers an already-running app.
 Use --local to bypass a Compose file. Local apps are never started or stopped.
@@ -165,10 +170,21 @@ async function up(config: Config, args: string[]): Promise<void> {
     if (existing) removeSite(config, name);
     let hostPort = port!;
     if (!local) {
-      const base = ["--project-name", project!, "--file", file!, ...profiles.flatMap((profile) => ["--profile", profile])];
+      const files = [file!, overrideFile(file!)].filter(existsSync);
       const env: Env = Object.fromEntries(urlEnv.map((key) => [key, url]));
+      const baseWith = (files: string[]) => ["--project-name", project!, ...files.flatMap((f) => ["--file", f]),
+        ...profiles.flatMap((profile) => ["--profile", profile])];
+      // A --port selection names a fixed host port, so only then are pinned ports kept.
+      const unpinned = port ? undefined : unpinnedPorts(baseWith(files), env);
+      if (unpinned) {
+        const path = portsOverridePath(config, name);
+        mkdirSync(dirname(path), { recursive: true });
+        writeFileSync(path, unpinned);
+        files.push(path);
+      }
+      const base = baseWith(files);
       compose([...base, "up", "-d", ...(flags.has("--build") ? ["--build"] : []), ...services], env);
-      hostPort = target ? publishedPort(base, target, env) : choosePort(publishedPorts(base, env), port);
+      hostPort = target ? publishedPort(base, target, env) : await choosePort(publishedPorts(base, env), port);
     }
     registerSite(config, name, hostPort);
     const ready = Date.now();
@@ -197,13 +213,34 @@ function installReaperFor(config: Config, mappings: Mapping[]): void {
   installReaper(config);
 }
 
-function choosePort(ports: string[], requested: string | undefined): string {
+async function choosePort(ports: string[], requested: string | undefined): Promise<string> {
   if (requested) {
     if (!ports.includes(requested)) throw new Error("requested port is not published by this stack");
     return requested;
   }
-  if (ports.length !== 1) throw new Error(`expected one published port, found ${ports.length}; select one with --target SERVICE:PORT or --port`);
-  return ports[0]!;
+  if (ports.length === 1) return ports[0]!;
+  // Stacks often publish databases beside the app; route to the only port that speaks HTTP.
+  const http = ports.length ? await httpPorts(ports) : [];
+  if (http.length === 1) return http[0]!;
+  throw new Error(`expected one published port, found ${ports.length}${http.length ? ` (${http.length} answer HTTP)` : ""}; `
+    + "select one with --target SERVICE:PORT or --port");
+}
+
+// Apps may still be booting after compose up, so keep probing until one answers or time runs out.
+async function httpPorts(ports: string[]): Promise<string[]> {
+  const deadline = Date.now() + Number(process.env.TUNNEL_PROBE_MS || 30_000);
+  const answers = async (port: string) => {
+    try {
+      await fetch(`http://127.0.0.1:${port}/`, { redirect: "manual", signal: AbortSignal.timeout(2000) });
+      return true;
+    } catch { return false; }
+  };
+  for (;;) {
+    const results = await Promise.all(ports.map(answers));
+    const found = ports.filter((_, i) => results[i]);
+    if (found.length || Date.now() >= deadline) return found;
+    await Bun.sleep(500);
+  }
 }
 
 // Borrowed local apps are never stopped; only their route goes.
@@ -211,6 +248,7 @@ function teardown(config: Config, mapping: Mapping): void {
   if (mapping.mode !== "local") {
     if (!mapping.project) throw new Error("Compose mapping is missing its project");
     removeProject(mapping.project, { volumes: !!mapping.disposable });
+    rmSync(portsOverridePath(config, mapping.name), { force: true });
   }
   removeSite(config, mapping.name);
   deleteMapping(config, mapping.name);

@@ -43,6 +43,7 @@ if (a[0] === 'compose' && a.includes('ps')) {
   const rows = (process.env.PORTS || '8123').split(',').map((port) => ({ Publishers: [{ PublishedPort: Number(port) }] }));
   console.log(process.env.ARRAY_PORTS ? JSON.stringify(rows) : rows.map((row) => JSON.stringify(row)).join('\\n'));
 }
+if (a[0] === 'compose' && a.includes('config') && process.env.COMPOSE_CONFIG) console.log(process.env.COMPOSE_CONFIG);
 if (a[0] === 'compose' && a.includes('port') && process.env.TARGET_PORT !== '') console.log('0.0.0.0:' + (process.env.TARGET_PORT || '55001'));
 if (a[0] === 'compose' && a.includes('caddy')) {
   fs.writeFileSync(process.env.MARKER, 'started');
@@ -93,7 +94,7 @@ function fixture() {
   const env = (extra: Record<string, string>) => ({
     ...process.env, HOME: root, PATH: `${bin}:${process.env.PATH}`, TUNNEL_CONFIG_DIR: config,
     TUNNEL_PROXY_PORT: "8000", TUNNEL_DOMAIN: "dev.example.com", TUNNEL_PROXY_IP: "100.64.0.2",
-    TUNNEL_STATE_DIR: "", TUNNEL_PROXY_BIND: "", TUNNEL_DNS: "",
+    TUNNEL_STATE_DIR: "", TUNNEL_PROXY_BIND: "", TUNNEL_DNS: "", TUNNEL_PROBE_MS: "0",
     SITES: sites, LOG: log, MARKER: join(root, "proxy-started"), PROXY_ENV: join(root, "proxy-env"), ...extra,
   });
   const command = (args: string[], cli = join(import.meta.dir, "cli.ts")) => [process.execPath, cli, ...args];
@@ -180,6 +181,36 @@ test("--target resolves an ephemeral host port after startup and is re-resolved 
   expect(f.calls()).toContain(`${base} up -d --build api`);
   expect(readFileSync(f.route, "utf8")).toContain("host.docker.internal:55002");
   expect(f.mapping().port).toBe("55002");
+}));
+
+test("pinned host ports are republished ephemerally and the default override file is loaded", withFixture((f) => {
+  writeFileSync(join(f.app, "compose.override.yaml"), "services: {}");
+  const config = { services: {
+    web: { ports: [{ mode: "ingress", target: 8000, published: "8000", protocol: "tcp" }] },
+    worker: {},
+  } };
+  success(f.run(["up", "--name", "review", "--disposable"], { COMPOSE_CONFIG: JSON.stringify(config) }));
+  const ports = join(f.config, "dev-proxy/compose/review.yaml");
+  expect(readFileSync(ports, "utf8")).toBe('services:\n  "web":\n    ports: !override [{"mode":"ingress","target":8000,"protocol":"tcp"}]\n');
+  expect(f.calls()).toContain(`${composeBase(f)} --file ${join(f.app, "compose.override.yaml")} --file ${ports} up -d`);
+
+  success(f.run(["down"]));
+  expect(existsSync(ports)).toBe(false);
+  // --port names a fixed host port, so it keeps the stack's own ports.
+  success(f.run(["up", "--name", "review", "--port", "8123"], { COMPOSE_CONFIG: JSON.stringify(config) }));
+  expect(existsSync(ports)).toBe(false);
+}));
+
+test("with several published ports, the only one answering HTTP is routed", withFixture(async (f) => {
+  // A separate process, since the CLI runs synchronously and would block an in-test server.
+  const server = Bun.spawn([process.execPath, "-e", "console.log(Bun.serve({ port: 0, fetch: () => new Response('ok') }).port)"], { stdout: "pipe" });
+  try {
+    const { value } = await server.stdout.getReader().read();
+    const port = new TextDecoder().decode(value).trim();
+    // Port 1 refuses connections, like a database that does not speak HTTP.
+    expect(success(f.run(["up", "--name", "review"], { PORTS: `1,${port}` }))).toContain(`(port ${port})`);
+    expect(failure(f.run(["up", "--name", "other", "--build"], { PORTS: "1,2" }))).toContain("found 2; select one");
+  } finally { server.kill(); }
 }));
 
 for (const [label, args, env] of [

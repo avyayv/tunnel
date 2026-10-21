@@ -31,6 +31,24 @@ export function publishedPorts(base: readonly string[], env: Env): string[] {
   return [...ports];
 }
 
+// Fixed host ports collide with the shared proxy and with other previews, so republish every
+// pinned port on an ephemeral host port. Returns a Compose override, or undefined if none is pinned.
+export function unpinnedPorts(base: readonly string[], env: Env): string | undefined {
+  const out = compose([...base, "config", "--format", "json"], env);
+  if (!out) return undefined;
+  type Port = { target: number; published?: string; protocol?: string; host_ip?: string; app_protocol?: string; mode?: string };
+  const services = (JSON.parse(out).services ?? {}) as Record<string, { ports?: Port[] }>;
+  const lines: string[] = [];
+  for (const [name, service] of Object.entries(services)) {
+    const ports = service.ports ?? [];
+    if (!ports.some((port) => port.published)) continue;
+    const ephemeral = ports.map(({ published: _, ...port }) => port);
+    // JSON is valid YAML; !override replaces the list instead of appending to it (Compose 2.24+).
+    lines.push(`  ${JSON.stringify(name)}:`, `    ports: !override ${JSON.stringify(ephemeral)}`);
+  }
+  return lines.length ? `services:\n${lines.join("\n")}\n` : undefined;
+}
+
 export function publishedPort(base: readonly string[], target: string, env: Env): string {
   const [service, port] = target.split(":") as [string, string];
   const out = compose([...base, "port", service, port], env);
