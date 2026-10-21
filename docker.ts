@@ -31,22 +31,43 @@ export function publishedPorts(base: readonly string[], env: Env): string[] {
   return [...ports];
 }
 
-// Fixed host ports collide with the shared proxy and with other previews, so republish every
-// pinned port on an ephemeral host port. Returns a Compose override, or undefined if none is pinned.
-export function unpinnedPorts(base: readonly string[], env: Env): string | undefined {
+// Previews of one project must not share host ports or names with each other or the proxy. Every
+// pinned port is republished on an ephemeral host port (unless keepPorts), and fixed container,
+// volume and network names fall back to project-prefixed ones; external resources stay shared.
+// Returns a Compose override, or undefined if nothing needs changing.
+export function previewOverride(base: readonly string[], env: Env, { keepPorts }: { keepPorts: boolean }): string | undefined {
   const out = compose([...base, "config", "--format", "json"], env);
   if (!out) return undefined;
   type Port = { target: number; published?: string; protocol?: string; host_ip?: string; app_protocol?: string; mode?: string };
-  const services = (JSON.parse(out).services ?? {}) as Record<string, { ports?: Port[] }>;
-  const lines: string[] = [];
-  for (const [name, service] of Object.entries(services)) {
+  type Resource = { name?: string; external?: boolean };
+  const config = JSON.parse(out) as {
+    name: string;
+    services?: Record<string, { ports?: Port[]; container_name?: string }>;
+    volumes?: Record<string, Resource>;
+    networks?: Record<string, Resource>;
+  };
+  // JSON is valid YAML. !override replaces a list instead of appending to it; !reset removes a
+  // key (both Compose 2.24+).
+  const key = JSON.stringify;
+  const sections: string[] = [];
+  const services: string[] = [];
+  for (const [name, service] of Object.entries(config.services ?? {})) {
+    const fields: string[] = [];
     const ports = service.ports ?? [];
-    if (!ports.some((port) => port.published)) continue;
-    const ephemeral = ports.map(({ published: _, ...port }) => port);
-    // JSON is valid YAML; !override replaces the list instead of appending to it (Compose 2.24+).
-    lines.push(`  ${JSON.stringify(name)}:`, `    ports: !override ${JSON.stringify(ephemeral)}`);
+    if (!keepPorts && ports.some((port) => port.published)) {
+      fields.push(`    ports: !override ${key(ports.map(({ published: _, ...port }) => port))}`);
+    }
+    if (service.container_name) fields.push("    container_name: !reset null");
+    if (fields.length) services.push(`  ${key(name)}:`, ...fields);
   }
-  return lines.length ? `services:\n${lines.join("\n")}\n` : undefined;
+  if (services.length) sections.push("services:", ...services);
+  for (const kind of ["volumes", "networks"] as const) {
+    // Compose reports the computed PROJECT_KEY name too, so only other names were set explicitly.
+    const named = Object.entries(config[kind] ?? {})
+      .filter(([name, resource]) => !resource.external && resource.name && resource.name !== `${config.name}_${name}`);
+    if (named.length) sections.push(`${kind}:`, ...named.flatMap(([name]) => [`  ${key(name)}:`, "    name: !reset null"]));
+  }
+  return sections.length ? `${sections.join("\n")}\n` : undefined;
 }
 
 export function publishedPort(base: readonly string[], target: string, env: Env): string {

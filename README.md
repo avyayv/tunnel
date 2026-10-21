@@ -54,7 +54,7 @@ From any directory containing a Compose file, start a named preview:
 tunnel up --name my-branch --build .
 ```
 
-Tunnel starts the Compose app and reuses one shared Caddy proxy for all previews. Ports pinned in the Compose file (like `8000:8000`) are republished on free host ports, so any Compose project works unchanged and several previews of it can run at once; when a stack publishes several ports, tunnel routes the one that answers HTTP. A `compose.override.yaml` next to the Compose file is loaded as usual. Use a different name for each worktree. Repeat `up` in the same worktree to reuse its name and renew its lease.
+Tunnel starts the Compose app and reuses one shared Caddy proxy for all previews. Ports pinned in the Compose file (like `8000:8000`) are republished on free host ports, and fixed `container_name`s and volume or network names get per-preview names (external ones stay shared), so several previews of one project can run at once; when a stack publishes several ports, tunnel routes the one that answers HTTP. A `compose.override.yaml` next to the Compose file is loaded as usual. Use a different name for each worktree. Repeat `up` in the same worktree to reuse its name and renew its lease.
 
 For an app you already started yourself:
 

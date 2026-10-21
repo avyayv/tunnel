@@ -4,7 +4,7 @@ import { lookup } from "node:dns/promises";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { configDir, configFile, detectIP, savedSettings, settings, validatePort, type Config, type Settings } from "./config";
-import { compose, projectResources, publishedPort, publishedPorts, removeProject, sh, unpinnedPorts, type Env } from "./docker";
+import { compose, projectResources, publishedPort, publishedPorts, removeProject, previewOverride, sh, type Env } from "./docker";
 import { DEFAULT_TTL, installReaper, parseTTL, requireExpirySupport } from "./lease";
 import { ensureProxy, origin, proxyContainer, registerSite, removeSite, sitePath } from "./proxy";
 import { acquireLock, deleteMapping, readMappings, saveMapping, type Mapping } from "./state";
@@ -12,7 +12,7 @@ import { acquireLock, deleteMapping, readMappings, saveMapping, type Mapping } f
 const COMPOSE_FILES = ["compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"];
 // Compose loads the override next to the default file only when no --file is given, so do it here.
 const overrideFile = (file: string) => file.replace(/\.(ya?ml)$/, ".override.$1");
-const portsOverridePath = (config: Config, name: string) => join(config.stateDir, "dev-proxy", "compose", `${name}.yaml`);
+const overridePath = (config: Config, name: string) => join(config.stateDir, "dev-proxy", "compose", `${name}.yaml`);
 
 const HELP = `usage: tunnel up [--name NAME] [--port PORT | --target SERVICE:PORT] [--build]
                  [--local] [--ttl 30m|never] [--disposable] [--service SERVICE]
@@ -27,8 +27,8 @@ const HELP = `usage: tunnel up [--name NAME] [--port PORT | --target SERVICE:POR
        tunnel --skill
        tunnel --help
 
-Fixed host ports in the Compose file are republished on free ports, so stacks
-never collide; with several, the one answering HTTP is routed.
+Fixed host ports and container, volume and network names in the Compose file
+are made per-preview, so stacks never collide; with several, the one answering HTTP is routed.
 --port selects a published host port (and keeps fixed ports). --target SERVICE:PORT resolves the host
 port Compose published for a service's container port after startup.
 Without a Compose file, --port registers an already-running app.
@@ -175,12 +175,14 @@ async function up(config: Config, args: string[]): Promise<void> {
       const baseWith = (files: string[]) => ["--project-name", project!, ...files.flatMap((f) => ["--file", f]),
         ...profiles.flatMap((profile) => ["--profile", profile])];
       // A --port selection names a fixed host port, so only then are pinned ports kept.
-      const unpinned = port ? undefined : unpinnedPorts(baseWith(files), env);
-      if (unpinned) {
-        const path = portsOverridePath(config, name);
+      const override = previewOverride(baseWith(files), env, { keepPorts: !!port });
+      const path = overridePath(config, name);
+      if (override) {
         mkdirSync(dirname(path), { recursive: true });
-        writeFileSync(path, unpinned);
+        writeFileSync(path, override);
         files.push(path);
+      } else {
+        rmSync(path, { force: true }); // Left by an earlier up whose stack needed one.
       }
       const base = baseWith(files);
       compose([...base, "up", "-d", ...(flags.has("--build") ? ["--build"] : []), ...services], env);
@@ -248,7 +250,7 @@ function teardown(config: Config, mapping: Mapping): void {
   if (mapping.mode !== "local") {
     if (!mapping.project) throw new Error("Compose mapping is missing its project");
     removeProject(mapping.project, { volumes: !!mapping.disposable });
-    rmSync(portsOverridePath(config, mapping.name), { force: true });
+    rmSync(overridePath(config, mapping.name), { force: true });
   }
   removeSite(config, mapping.name);
   deleteMapping(config, mapping.name);

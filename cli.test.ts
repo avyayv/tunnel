@@ -201,6 +201,28 @@ test("pinned host ports are republished ephemerally and the default override fil
   expect(existsSync(ports)).toBe(false);
 }));
 
+test("fixed container, volume and network names become project-scoped; external ones stay shared", withFixture((f) => {
+  const config = {
+    name: "tunnel-review",
+    services: {
+      web: { container_name: "fixed-web", ports: [{ target: 80, published: "80", protocol: "tcp" }] },
+      // With --port, pinned ports are kept but fixed names are still removed.
+    },
+    volumes: { data: { name: "fixed-data" }, cache: { name: "tunnel-review_cache" }, shared: { name: "shared", external: true } },
+    networks: { default: { name: "tunnel-review_default" }, edge: { name: "fixed-edge" }, outside: { name: "outside", external: true } },
+  };
+  success(f.run(["up", "--name", "review", "--port", "8123"], { COMPOSE_CONFIG: JSON.stringify(config), PORTS: "8123" }));
+  expect(readFileSync(join(f.config, "dev-proxy/compose/review.yaml"), "utf8")).toBe([
+    "services:", '  "web":', "    container_name: !reset null",
+    "volumes:", '  "data":', "    name: !reset null",
+    "networks:", '  "edge":', "    name: !reset null", "",
+  ].join("\n"));
+
+  // A later up whose stack no longer needs an override drops the stale one.
+  success(f.run(["up"], { COMPOSE_CONFIG: JSON.stringify({ name: "tunnel-review", services: {} }), PORTS: "8123" }));
+  expect(existsSync(join(f.config, "dev-proxy/compose/review.yaml"))).toBe(false);
+}));
+
 test("with several published ports, the only one answering HTTP is routed", withFixture(async (f) => {
   // A separate process, since the CLI runs synchronously and would block an in-test server.
   const server = Bun.spawn([process.execPath, "-e", "console.log(Bun.serve({ port: 0, fetch: () => new Response('ok') }).port)"], { stdout: "pipe" });
