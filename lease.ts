@@ -9,7 +9,7 @@ import { writeAtomic } from "./state";
 export const DEFAULT_TTL = 30 * 60_000;
 
 // Everything `tunnel cleanup` loads at runtime, plus the proxy files next to it.
-const RUNTIME_FILES = ["cli.ts", "config.ts", "docker.ts", "lease.ts", "proxy.ts", "state.ts", "compose.yaml", "Caddyfile", "Corefile"];
+const RUNTIME_FILES = ["cli.ts", "config.ts", "docker.ts", "lease.ts", "proxy.ts", "state.ts", "worktree.ts", "compose.yaml", "Caddyfile", "Corefile"];
 
 export function parseTTL(value: string): number {
   if (value === "never") return 0;

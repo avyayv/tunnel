@@ -12,10 +12,16 @@ export interface Settings {
   bind?: string;
   dns?: "external" | "split";
   stateDir?: string;
+  worktrees?: string;
 }
 
 export function savedSettings(): Settings {
   return existsSync(configFile) ? JSON.parse(readFileSync(configFile, "utf8")) : {};
+}
+
+// Where tunnel new puts worktrees. Needs no network settings, so worktrees work before setup.
+export function worktreeRoot(saved = savedSettings(), env = process.env): string {
+  return resolve(env.TUNNEL_WORKTREES?.trim() || saved.worktrees || join(homedir(), ".worktrees"));
 }
 
 export function detectIP(): string {

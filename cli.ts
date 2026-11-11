@@ -1,13 +1,17 @@
 #!/usr/bin/env bun
 import { randomBytes } from "node:crypto";
 import { lookup } from "node:dns/promises";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { configDir, configFile, detectIP, savedSettings, settings, validatePort, type Config, type Settings } from "./config";
-import { compose, projectResources, publishedPort, publishedPorts, removeProject, previewOverride, sh, type Env } from "./docker";
+import { configDir, configFile, detectIP, savedSettings, settings, validatePort, worktreeRoot, type Config, type Settings } from "./config";
+import {
+  compose, composeProjects, defaultProjectName, projectResources, pruneBuildLeftovers, publishedPort, publishedPorts, removeProject,
+  previewOverride, sh, type Env,
+} from "./docker";
 import { DEFAULT_TTL, installReaper, parseTTL, requireExpirySupport } from "./lease";
 import { ensureProxy, origin, proxyContainer, registerSite, removeSite, sitePath } from "./proxy";
-import { acquireLock, deleteMapping, readMappings, saveMapping, type Mapping } from "./state";
+import { acquireLock, deleteMapping, deleteRetained, readMappings, readRetained, saveMapping, saveRetained, type Mapping } from "./state";
+import { createWorktree, inside, isDirty, removeWorktree, worktreeOf } from "./worktree";
 
 const COMPOSE_FILES = ["compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"];
 // Compose loads the override next to the default file only when no --file is given, so do it here.
@@ -18,11 +22,14 @@ const HELP = `usage: tunnel up [--name NAME] [--port PORT | --target SERVICE:POR
                  [--local] [--ttl 30m|never] [--disposable] [--service SERVICE]
                  [--profile PROFILE] [--url-env VARIABLE] [dir]
        tunnel extend NAME [30m|never]
+       tunnel new BRANCH [--from REF]
+       tunnel rm [dir] [--force] [--keep-volumes]
+       tunnel prune [--dry-run]
        tunnel down [name|dir]
        tunnel cleanup
        tunnel ls
        tunnel setup [--ip IPV4] [--domain DOMAIN|auto] [--port PORT]
-                    [--bind IPV4] [--dns external|split] [--state-dir DIR]
+                    [--bind IPV4] [--dns external|split] [--state-dir DIR] [--worktrees DIR]
        tunnel doctor
        tunnel --skill
        tunnel --help
@@ -35,7 +42,14 @@ Without a Compose file, --port registers an already-running app.
 Use --local to bypass a Compose file. Local apps are never started or stopped.
 New previews expire after 30 minutes (macOS launchd; checked every minute).
 Elsewhere, pass --ttl never and remove previews with tunnel down.
---disposable deletes Compose volumes on teardown; otherwise data is retained.
+--disposable deletes Compose volumes on teardown; otherwise data is retained, and a later up
+in the same directory adopts it.
+new creates a worktree of the current repository in the worktree directory (setup --worktrees,
+default ~/.worktrees), symlinks .env* files and node_modules from the main checkout, and prints
+its path. rm deletes a worktree with every preview and Compose stack started in it, including
+volumes and built images, and prints the main checkout's path. prune does the same for stacks
+whose directory is gone, and removes untagged images and week-old build cache; on macOS the
+expiry job prunes stacks of deleted worktrees hourly.
 Repeat --service, --profile, or --url-env; URL variables apply before Compose starts.
 setup saves configuration; up starts the shared proxy automatically.
 Requires Bun and running Docker with Compose 2.24 or later. No public relay or access control.`;
@@ -148,7 +162,8 @@ async function up(config: Config, args: string[]): Promise<void> {
     // Teardown removes everything labeled with the project, so never adopt anything already there,
     // including volumes retained from an earlier preview (inspect or remove those by hand).
     const found = projectResources(project);
-    if (found.containers.length || found.networks.length || found.volumes.length) {
+    const ours = readRetained(config).some((kept) => kept.project === project && kept.dir === dir);
+    if (found.containers.length || found.networks.length || (found.volumes.length && !ours)) {
       throw new Error(`Docker already has resources for Compose project ${project} that no preview owns. `
         + `Inspect them with docker ps -a, docker network ls and docker volume ls using --filter label=com.docker.compose.project=${project}, or choose another --name`);
     }
@@ -163,7 +178,10 @@ async function up(config: Config, args: string[]): Promise<void> {
     fixedPort: local ? undefined : port,
   };
   // Record a new preview before starting it, so after a crash down or cleanup can still remove it.
-  if (!existing) saveMapping(config, mapping);
+  if (!existing) {
+    saveMapping(config, mapping);
+    if (project) deleteRetained(config, project);
+  }
   try {
     // The prior host port may be reassigned when Compose recreates containers. Stop routing to it
     // until the current stack's port has been resolved and registered successfully.
@@ -252,6 +270,7 @@ function teardown(config: Config, mapping: Mapping): void {
   if (mapping.mode !== "local") {
     if (!mapping.project) throw new Error("Compose mapping is missing its project");
     removeProject(mapping.project, { volumes: !!mapping.disposable });
+    if (!mapping.disposable && projectResources(mapping.project).volumes.length) saveRetained(config, { project: mapping.project, dir: mapping.dir });
     rmSync(overridePath(config, mapping.name), { force: true });
   }
   removeSite(config, mapping.name);
@@ -286,6 +305,94 @@ function cleanup(config: Config): void {
   }
 }
 
+// Removes everything Docker holds for directories inside `root` (or, for prune, for directories that
+// no longer exist): tunnel's previews, their retained volumes, and Compose stacks started by hand.
+// A stack with containers names its directory; one with only volumes left is matched by Compose's
+// default project name.
+function removeStacks(config: Config, gone: (dir: string) => boolean, { volumes, dryRun = false, byName }: {
+  volumes: boolean; dryRun?: boolean; byName?: string;
+}): string[] {
+  const removed: string[] = [];
+  const act = (label: string, fn: () => void) => {
+    if (!dryRun) fn();
+    removed.push(label);
+  };
+  for (const mapping of readMappings(config).filter((m) => gone(m.dir))) {
+    act(`preview ${mapping.name}`, () => teardown(config, { ...mapping, disposable: mapping.disposable || volumes }));
+  }
+  const owned = new Set(readMappings(config).flatMap((m) => m.project ? [m.project] : []));
+  for (const [project, dir] of composeProjects()) {
+    if (gone(dir) && !owned.has(project)) act(`stack ${project}`, () => removeProject(project, { volumes }));
+  }
+  if (volumes) {
+    for (const kept of readRetained(config).filter((r) => gone(r.dir))) {
+      act(`volumes of ${kept.project}`, () => { removeProject(kept.project, { volumes: true }); deleteRetained(config, kept.project); });
+    }
+    if (byName && !composeProjects().has(byName) && projectResources(byName).volumes.length) {
+      act(`volumes of ${byName}`, () => removeProject(byName, { volumes: true }));
+    }
+  }
+  return removed;
+}
+
+function newWorktree(args: string[]): void {
+  const flags = parseFlags(args, { "--from": "value" });
+  if (flags.positional.length !== 1) throw new Error("usage: tunnel new BRANCH [--from REF]");
+  const path = createWorktree(process.cwd(), worktreeRoot(), flags.positional[0]!, flags.value("--from"));
+  // Worktrees get cleaned up after even when no preview ever ran.
+  if (process.platform === "darwin") {
+    try { const config = settings(); installReaperFor(config, readMappings(config)); }
+    catch (error) { console.error(`tunnel: worktree created, but automatic pruning is not installed: ${(error as Error).message}`); }
+  }
+  console.log(path);
+}
+
+function rm(config: Config, args: string[]): void {
+  const flags = parseFlags(args, { "--force": "switch", "--keep-volumes": "switch" });
+  if (flags.positional.length > 1) throw new Error("usage: tunnel rm [dir] [--force] [--keep-volumes]");
+  const { top, main } = worktreeOf(resolve(flags.positional[0] ?? process.cwd()));
+  if (top === main) throw new Error(`${top} is the repository's main checkout, not a worktree`);
+  if (!flags.has("--force") && isDirty(top)) throw new Error(`${top} has uncommitted or untracked changes; commit them or pass --force`);
+  const volumes = !flags.has("--keep-volumes");
+  for (const label of removeStacks(config, (dir) => inside(top, dir), { volumes, byName: defaultProjectName(top) })) {
+    console.error(`tunnel: removed ${label}`);
+  }
+  removeWorktree(main, top);
+  console.error(`tunnel: removed worktree ${top}`);
+  console.log(main);
+}
+
+function prune(config: Config, args: string[]): void {
+  const flags = parseFlags(args, { "--dry-run": "switch" });
+  if (flags.positional.length) throw new Error("usage: tunnel prune [--dry-run]");
+  const dryRun = flags.has("--dry-run");
+  const removed = removeStacks(config, (dir) => !existsSync(dir), { volumes: true, dryRun });
+  for (const label of removed) console.log(`${dryRun ? "would remove" : "removed"} ${label}`);
+  if (!dryRun) pruneBuildLeftovers();
+  console.log(dryRun ? "would also remove untagged images and build cache older than a week" : "removed untagged images and build cache older than a week");
+}
+
+// The expiry job prunes at most hourly, and only stacks of deleted worktrees under the worktree
+// directory, which tunnel created; anything else waits for an explicit prune.
+const PRUNE_EVERY = 60 * 60_000;
+const pruneStamp = (config: Config) => join(config.stateDir, "dev-proxy", "pruned");
+const pruneDue = (config: Config) => (statSync(pruneStamp(config), { throwIfNoEntry: false })?.mtimeMs ?? 0) + PRUNE_EVERY <= Date.now();
+
+function scheduledPrune(config: Config): void {
+  mkdirSync(dirname(pruneStamp(config)), { recursive: true });
+  writeFileSync(pruneStamp(config), ""); // Before pruning, so a failing prune is retried an hour later, not every minute.
+  const root = worktreeRoot();
+  try {
+    for (const label of removeStacks(config, (dir) => inside(root, dir) && !existsSync(dir), { volumes: true })) {
+      console.log(`tunnel: removed ${label} (its worktree is gone)`);
+    }
+    pruneBuildLeftovers();
+  } catch (error) {
+    console.error(`tunnel: prune failed; retrying in an hour: ${(error as Error).message}`);
+    process.exitCode = 1;
+  }
+}
+
 function extend(config: Config, args: string[]): void {
   if (!args[0] || args.length > 2) throw new Error("usage: tunnel extend NAME [30m|never]");
   const all = readMappings(config);
@@ -308,7 +415,7 @@ function ls(config: Config): void {
 }
 
 function setup(args: string[]): void {
-  const keys: Record<string, keyof Settings> = { "--ip": "ip", "--domain": "domain", "--port": "port", "--bind": "bind", "--dns": "dns", "--state-dir": "stateDir" };
+  const keys: Record<string, keyof Settings> = { "--ip": "ip", "--domain": "domain", "--port": "port", "--bind": "bind", "--dns": "dns", "--state-dir": "stateDir", "--worktrees": "worktrees" };
   const flags = parseFlags(args, Object.fromEntries(Object.keys(keys).map((flag) => [flag, "value" as const])));
   if (flags.positional.length) throw new Error(`invalid setup option: ${flags.positional[0]}`);
   const saved = savedSettings();
@@ -316,7 +423,7 @@ function setup(args: string[]): void {
   for (const [flag, key] of Object.entries(keys)) {
     const value = flags.value(flag);
     if (value === undefined) continue;
-    Object.assign(next, { [key]: key === "domain" && value === "auto" ? undefined : key === "stateDir" ? resolve(value) : value });
+    Object.assign(next, { [key]: key === "domain" && value === "auto" ? undefined : key === "stateDir" || key === "worktrees" ? resolve(value) : value });
   }
   // Detect the address at most once, so before/after comparisons cannot differ by detection alone.
   // When detection is ambiguous, `--ip` is how the user resolves it, so fall back to that.
@@ -335,6 +442,7 @@ function setup(args: string[]): void {
   writeFileSync(configFile, `${JSON.stringify(next, null, 2)}\n`);
   const resolved = after.effective;
   console.log(`Saved ${configFile}\nURLs: ${origin(resolved, "app")}\nBind: ${resolved.bind}:${resolved.port}; DNS: ${resolved.dns}`);
+  console.log(`Worktrees: ${worktreeRoot(next)}`);
   if (resolved.dns === "split") console.log(`Configure a restricted nameserver for ${resolved.domain} pointing to ${resolved.ip}.`);
   else if (next.domain) console.log(`Configure wildcard DNS for *.${resolved.domain} pointing to ${resolved.ip}.`);
   console.log("Run tunnel up to start the proxy. Docker and Bun must already be installed.");
@@ -379,7 +487,7 @@ async function main([command, ...args]: string[]): Promise<void> {
     console.log(HELP);
     return;
   }
-  if (!["up", "down", "ls", "doctor", "cleanup", "extend", "setup"].includes(command)) throw new Error(`unknown command: ${command}\n${HELP}`);
+  if (!["up", "down", "ls", "doctor", "cleanup", "extend", "setup", "new", "rm", "prune"].includes(command)) throw new Error(`unknown command: ${command}\n${HELP}`);
   if (command === "ls" || command === "doctor") {
     if (args.length) throw new Error(`${command} takes no arguments`);
     return command === "ls" ? ls(settings()) : doctor(settings());
@@ -388,17 +496,23 @@ async function main([command, ...args]: string[]): Promise<void> {
   // skips (with a log line) a tick while another command runs. Everything else waits its turn.
   const scheduled = command === "cleanup" && args[0] === "--scheduled";
   if (command === "cleanup" && args.length > (scheduled ? 1 : 0)) throw new Error("cleanup takes no arguments");
-  if (scheduled && !readMappings(settings()).some(expired)) return;
+  if (scheduled && !readMappings(settings()).some(expired) && !pruneDue(settings())) return;
   const release = acquireLock({ wait: !scheduled });
   if (!release) return;
   try {
     // Settings are read under the lock, so a concurrent setup cannot leave this command using stale ones.
     if (command === "setup") return setup(args);
+    if (command === "new") return newWorktree(args);
     const config = settings();
     if (command === "up") await up(config, args);
     else if (command === "down") down(config, args);
     else if (command === "extend") extend(config, args);
-    else cleanup(config);
+    else if (command === "rm") rm(config, args);
+    else if (command === "prune") prune(config, args);
+    else {
+      cleanup(config);
+      if (scheduled && pruneDue(config)) scheduledPrune(config);
+    }
   } finally { release(); }
 }
 

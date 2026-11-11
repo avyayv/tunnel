@@ -8,7 +8,8 @@ const macOS = test.skipIf(!darwin);
 const otherOS = test.skipIf(darwin);
 
 // Fake docker: logs every call, plays a running proxy, and tracks Compose project resources as
-// files named LOG.<project>.<c|n|v> (containers, networks, volumes). `compose up` creates all three.
+// files named LOG.<project>.<c|n|v|i> (containers, networks, volumes, images). `compose up` creates
+// all four, and records the project's directory in LOG.<project>.dir, which ps reports.
 // FAIL is a comma-separated list of substrings; a call whose arguments contain one fails.
 const DOCKER = `
 const fs = require('node:fs');
@@ -18,7 +19,8 @@ fs.appendFileSync(process.env.LOG, JSON.stringify({ call: 'docker ' + line, url:
 const state = (project, kind) => process.env.LOG + '.' + project + '.' + kind;
 const project = a[0] === 'compose' && a.includes('--project-name') ? a[a.indexOf('--project-name') + 1] : undefined;
 if (project && a.includes('up')) {
-  for (const kind of ['c', 'n', 'v']) fs.writeFileSync(state(project, kind), '');
+  for (const kind of ['c', 'n', 'v', 'i']) fs.writeFileSync(state(project, kind), '');
+  fs.writeFileSync(state(project, 'dir'), require('node:path').dirname(a[a.indexOf('--file') + 1]));
   if (process.env.SLOW_UP) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(process.env.SLOW_UP));
 }
 if (process.env.CRASH && line.includes(process.env.CRASH)) process.kill(process.ppid, 'SIGKILL');
@@ -29,12 +31,21 @@ const labeled = (kind) => {
 };
 const drop = (kind) => { for (const id of a) if (id.endsWith('-' + kind)) fs.rmSync(state(id.slice(0, -2), kind), { force: true }); };
 if (a[0] === 'ps' && a[1] === '-aq') labeled('c');
+else if (a[0] === 'ps' && a[1] === '-a') {
+  const dir = require('node:path').dirname(process.env.LOG);
+  for (const file of fs.readdirSync(dir).filter((f) => f.endsWith('.c'))) {
+    const owner = file.slice(require('node:path').basename(process.env.LOG).length + 1, -2);
+    if (fs.existsSync(state(owner, 'dir'))) console.log(owner + '\t' + fs.readFileSync(state(owner, 'dir'), 'utf8'));
+  }
+}
 else if (a[0] === 'ps' && (!process.env.FRESH_PROXY || fs.existsSync(process.env.MARKER))) {
   console.log(JSON.stringify({ Names: 'unrelated-caddy', Ports: '0.0.0.0:9999->80/tcp' }));
   console.log(JSON.stringify({ Names: 'right-caddy', Ports: '0.0.0.0:8000->80/tcp' }));
 }
 if (line.startsWith('network ls')) labeled('n');
 if (line.startsWith('volume ls')) labeled('v');
+if (line.startsWith('image ls')) labeled('i');
+if (a[0] === 'rmi') drop('i');
 if (a[0] === 'rm') drop('c');
 if (line.startsWith('network rm')) drop('n');
 if (line.startsWith('volume rm')) drop('v');
@@ -114,7 +125,12 @@ function fixture() {
     urlFor: (prefix: string): string | undefined => rows().find((row) => row.call.startsWith(prefix))?.url,
     // Whether the fake Docker holds a resource of the project: c(ontainers), n(etworks), v(olumes).
     docker: (project: string, kind: "c" | "n" | "v") => existsSync(`${log}.${project}.${kind}`),
-    seedDocker: (project: string, kind: "c" | "n" | "v") => writeFileSync(`${log}.${project}.${kind}`, ""),
+    seedDocker: (project: string, kind: "c" | "n" | "v" | "i") => writeFileSync(`${log}.${project}.${kind}`, ""),
+    // A Compose stack started by hand (not by tunnel) from `dir`.
+    seedStack: (project: string, dir: string) => {
+      for (const kind of ["c", "n", "v", "i"]) writeFileSync(`${log}.${project}.${kind}`, "");
+      writeFileSync(`${log}.${project}.dir`, dir);
+    },
     mapping: () => JSON.parse(readFileSync(mappingPath, "utf8")),
     editMapping: (change: (mapping: Record<string, unknown>) => void) => {
       const mapping = JSON.parse(readFileSync(mappingPath, "utf8"));
@@ -140,6 +156,12 @@ function success(result: ReturnType<Fixture["run"]>) {
   return result.stdout.toString();
 }
 
+// For commands that report progress on stderr and their result on stdout.
+function result(run: ReturnType<Fixture["run"]>) {
+  expect(run.exitCode).toBe(0);
+  return run.stdout.toString().trim();
+}
+
 function failure(result: ReturnType<Fixture["run"]>) {
   expect(result.exitCode).not.toBe(0);
   return result.stderr.toString();
@@ -163,8 +185,13 @@ test("Compose preview routes its published port, reuses its name, and retains vo
   expect(f.docker("tunnel-review", "v")).toBe(true);
   expect(existsSync(f.route)).toBe(false);
   expect(existsSync(f.mappingPath)).toBe(false);
-  // Retained data is never adopted by a later preview; only manual inspection reaches it.
-  expect(failure(f.run(["up", "--name", "review"]))).toContain("docker volume ls");
+  // Retained data is adopted only by a later preview of the same directory.
+  const other = join(f.root, "other");
+  mkdirSync(other);
+  writeFileSync(join(other, "compose.yaml"), "services: {}");
+  expect(failure(f.run(["up", "--name", "review", other]))).toContain("docker volume ls");
+  expect(f.docker("tunnel-review", "v")).toBe(true);
+  success(f.run(["up", "--name", "review"]));
   expect(f.docker("tunnel-review", "v")).toBe(true);
 }));
 
@@ -506,6 +533,7 @@ test("scheduled cleanup logs and skips a busy tick; manual commands wait for the
 
 test("scheduled cleanup does not take the lock when nothing has expired", withFixture((f) => {
   success(f.run(["up", "--name", "review", "--ttl", "never"]));
+  writeFileSync(join(f.config, "dev-proxy/pruned"), ""); // Pruned within the hour.
   mkdirSync(f.lock);
   writeFileSync(join(f.lock, "pid"), String(process.pid));
   success(f.run(["cleanup", "--scheduled"]));
@@ -534,7 +562,7 @@ macOS("the reaper runs a private copy of tunnel that survives deleting the check
   const contents = readFileSync(join(agents, readdirSync(agents)[0]!), "utf8");
   const cli = /<string>([^<]+\/cli\.ts)<\/string><string>cleanup<\/string><string>--scheduled<\/string>/.exec(contents)![1]!;
   expect(cli.startsWith(join(f.config, "runtime"))).toBe(true);
-  expect(readdirSync(join(cli, "..")).sort()).toEqual(["Caddyfile", "Corefile", "cli.ts", "compose.yaml", "config.ts", "docker.ts", "lease.ts", "proxy.ts", "state.ts"]);
+  expect(readdirSync(join(cli, "..")).sort()).toEqual(["Caddyfile", "Corefile", "cli.ts", "compose.yaml", "config.ts", "docker.ts", "lease.ts", "proxy.ts", "state.ts", "worktree.ts"]);
   expire(f);
   expect(success(f.runCli(cli, ["cleanup", "--scheduled"]))).toContain("review removed");
   expect(existsSync(f.mappingPath)).toBe(false);
@@ -620,4 +648,100 @@ test("help and skill work without configuration or Docker", withFixture((f) => {
   expect(success(f.run(["--help"]))).toContain("tunnel setup");
   expect(success(f.run(["--skill"]))).toBe(readFileSync(join(import.meta.dir, "skills/tunnel-preview/SKILL.md"), "utf8") + "\n");
   expect(f.calls()).toEqual([]);
+}));
+
+// A git repository of the fixture's app, with worktrees under root/worktrees.
+function repo(f: Fixture) {
+  const git = (...args: string[]) => {
+    const result = Bun.spawnSync(["git", "-C", f.app, "-c", "user.name=t", "-c", "user.email=t@example.com", ...args]);
+    if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+    return result.stdout.toString().trim();
+  };
+  writeFileSync(join(f.app, ".gitignore"), ".env\nnode_modules\n");
+  writeFileSync(join(f.app, ".env.example"), "TRACKED=1\n");
+  git("init", "-q", "-b", "main");
+  git("add", ".");
+  git("commit", "-qm", "init");
+  writeFileSync(join(f.app, ".env"), "SECRET=1\n");
+  mkdirSync(join(f.app, "web/node_modules/pkg"), { recursive: true });
+  const worktrees = join(f.root, "worktrees");
+  return { git, worktrees, env: { TUNNEL_WORKTREES: worktrees }, path: (name: string) => join(worktrees, name) };
+}
+
+test("new creates a branch worktree with shared env files and node_modules, and is idempotent", withFixture((f) => {
+  const r = repo(f);
+  const path = r.path("feat-x");
+  expect(result(f.run(["new", "feat/x"], r.env))).toBe(path);
+  expect(r.git("-C", path, "rev-parse", "--abbrev-ref", "HEAD")).toBe("feat/x");
+  expect(readFileSync(join(path, ".env"), "utf8")).toBe("SECRET=1\n");
+  expect(realpathSync(join(path, "web/node_modules"))).toBe(join(f.app, "web/node_modules"));
+  expect(readFileSync(join(path, ".env.example"), "utf8")).toBe("TRACKED=1\n");
+  // Again, even from inside the worktree: the same path, nothing new.
+  expect(Bun.spawnSync([process.execPath, join(import.meta.dir, "cli.ts"), "new", "feat/x"], {
+    cwd: path, env: { ...process.env, ...r.env, TUNNEL_CONFIG_DIR: f.config, HOME: f.root },
+  }).stdout.toString().trim()).toBe(path);
+  expect(failure(f.run(["new", "bad..name"], r.env))).toContain("invalid branch name");
+}));
+
+test("rm removes a worktree with its previews, hand-started stacks and their data", withFixture((f) => {
+  const r = repo(f);
+  const path = r.path("feat");
+  result(f.run(["new", "feat"], r.env));
+  success(f.run(["up", "--name", "review", path], r.env));
+  success(f.run(["up", "--name", "kept", path], r.env));
+  success(f.run(["down", "kept"], r.env));
+  expect(f.docker("tunnel-kept", "v")).toBe(true);
+  f.seedStack("feat", path);
+  f.seedStack("elsewhere", f.app);
+
+  expect(failure(f.run(["rm", f.app], r.env))).toContain("main checkout");
+  writeFileSync(join(path, "draft.txt"), "wip");
+  expect(failure(f.run(["rm", path], r.env))).toContain("--force");
+  expect(existsSync(path)).toBe(true);
+
+  expect(result(f.run(["rm", path, "--force"], r.env))).toBe(f.app);
+  expect(existsSync(path)).toBe(false);
+  expect(existsSync(f.mappingPath)).toBe(false);
+  for (const project of ["tunnel-review", "tunnel-kept", "feat"]) {
+    for (const kind of ["c", "n", "v", "i"] as const) expect(f.docker(project, kind)).toBe(false);
+  }
+  expect(f.docker("elsewhere", "v")).toBe(true);
+  expect(r.git("worktree", "list")).not.toContain(path);
+}));
+
+test("rm --keep-volumes keeps a worktree's data but not its images", withFixture((f) => {
+  const r = repo(f);
+  const path = r.path("feat");
+  result(f.run(["new", "feat"], r.env));
+  success(f.run(["up", "--name", "review", path], r.env));
+  result(f.run(["rm", path, "--keep-volumes"], r.env));
+  expect(f.docker("tunnel-review", "c")).toBe(false);
+  expect(f.docker("tunnel-review", "i")).toBe(false);
+  expect(f.docker("tunnel-review", "v")).toBe(true);
+}));
+
+test("prune removes stacks whose directory is gone, and dry runs change nothing", withFixture((f) => {
+  const gone = join(f.root, "deleted");
+  f.seedStack("orphan", gone);
+  f.seedStack("alive", f.app);
+  expect(success(f.run(["prune", "--dry-run"]))).toContain("would remove stack orphan");
+  expect(f.docker("orphan", "v")).toBe(true);
+  expect(success(f.run(["prune"]))).toContain("removed stack orphan");
+  for (const kind of ["c", "n", "v", "i"] as const) expect(f.docker("orphan", kind)).toBe(false);
+  expect(f.docker("alive", "v")).toBe(true);
+  expect(f.calls()).toContain("docker image prune -f");
+  expect(f.calls()).toContain("docker builder prune -f --filter until=168h");
+}));
+
+test("the scheduled job prunes hourly, only stacks of deleted worktrees", withFixture((f) => {
+  const worktrees = join(f.root, "worktrees");
+  f.seedStack("deleted-worktree", join(worktrees, "deleted"));
+  f.seedStack("deleted-elsewhere", join(f.root, "deleted"));
+  const env = { TUNNEL_WORKTREES: worktrees };
+  expect(success(f.run(["cleanup", "--scheduled"], env))).toContain("removed stack deleted-worktree");
+  expect(f.docker("deleted-worktree", "v")).toBe(false);
+  expect(f.docker("deleted-elsewhere", "v")).toBe(true);
+  f.seedStack("deleted-later", join(worktrees, "later"));
+  success(f.run(["cleanup", "--scheduled"], env));
+  expect(f.docker("deleted-later", "v")).toBe(true);
 }));

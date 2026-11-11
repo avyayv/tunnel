@@ -32,6 +32,12 @@ When asked to run, preview, or share a branch, try the installed `tunnel` comman
    - `tunnel doctor` reports the proxy and DNS state. Authentication may require a manual HTTP check.
 6. If hostname resolution fails, `curl --resolve <hostname>:<proxy-port>:<machine-IP> <full-URL>` can diagnose proxy routing. It does **not** prove native DNS or reachability from another device. Report those limits explicitly.
 
+## Worktrees
+
+- Create worktrees with `tunnel new <branch>` (prints the path; `cd "$(tunnel new <branch>)"`), not a bare `git worktree add`, so `.env*` files and `node_modules` are linked in.
+- Delete them with `tunnel rm <worktree>`: it tears down every preview and Compose stack started there, including volumes and images. It refuses uncommitted or untracked work; pass `--force` only when the user confirms that work can go, and `--keep-volumes` when they want the data.
+- `tunnel prune --dry-run` lists stacks whose directory is gone; run `tunnel prune` when disk is short or the user asks.
+
 ## Setup and Recovery
 
 - Requires Bun and running Docker with Compose. `tunnel up` bootstraps Caddy, not these dependencies.

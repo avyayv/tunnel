@@ -38,6 +38,30 @@ export function deleteMapping(config: Config, name: string): void {
   rmSync(join(mappingsDir(config), `${name}.json`), { force: true });
 }
 
+// Volumes a torn-down preview kept, with the directory it served, so a later up there can adopt
+// them and removing that directory (tunnel rm or prune) can delete them.
+export interface Retained {
+  readonly project: string;
+  readonly dir: string;
+}
+
+const retainedDir = (config: Config) => join(config.stateDir, "dev-proxy", "retained");
+
+export function readRetained(config: Config): Retained[] {
+  const dir = retainedDir(config);
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir).filter((file) => file.endsWith(".json"))
+    .map((file) => JSON.parse(readFileSync(join(dir, file), "utf8")) as Retained);
+}
+
+export function saveRetained(config: Config, retained: Retained): void {
+  writeAtomic(join(retainedDir(config), `${retained.project}.json`), `${JSON.stringify(retained)}\n`);
+}
+
+export function deleteRetained(config: Config, project: string): void {
+  rmSync(join(retainedDir(config), `${project}.json`), { force: true });
+}
+
 export function writeAtomic(path: string, contents: string): void {
   mkdirSync(dirname(path), { recursive: true });
   const temp = `${path}.${process.pid}.tmp`;

@@ -12,6 +12,7 @@
 
 <p align="center">
   <a href="#branch-previews">Branch previews</a> ·
+  <a href="#worktrees">Worktrees</a> ·
   <a href="#cleanup">Cleanup</a> ·
   <a href="skills/tunnel-preview/SKILL.md">Agent skill</a>
 </p>
@@ -64,6 +65,22 @@ tunnel up --local --name my-app --port 5173 .
 
 This borrows the running server: expiry removes its route, **not** the server. For Compose apps with multiple ports or special setup, options like `--target`, `--service`, `--profile`, and `--url-env` are available; see `tunnel --help` and the [networking guide](docs/networking.md).
 
+## Worktrees
+
+Tunnel can also own the worktrees your previews run from, so deleting one deletes everything it started:
+
+```sh
+cd "$(tunnel new my-branch)"     # worktree at ~/.worktrees/my-branch
+tunnel up --name my-branch --build .
+cd "$(tunnel rm)"                # back in the main checkout
+```
+
+`tunnel new BRANCH [--from REF]` checks out an existing local branch, tracks `origin/BRANCH`, or creates a new branch from `REF` (default `HEAD`). It symlinks untracked `.env*` files and every `node_modules` tree from the main checkout, so the worktree runs right away. Choose the directory with `tunnel setup --worktrees DIR`.
+
+`tunnel rm [dir]` removes the worktree with every preview and Compose stack started in it, including stacks started with plain `docker compose up`, their volumes and their built images. It refuses uncommitted or untracked work unless you pass `--force`; `--keep-volumes` keeps the data.
+
+`tunnel prune` cleans up after worktrees deleted some other way: it removes every Compose stack whose directory no longer exists, with its volumes and images, plus untagged images and build cache older than a week. `--dry-run` lists what it would remove. On macOS the expiry job runs it hourly for stacks of deleted worktrees in the worktree directory.
+
 ## Cleanup
 
 | Command | What it does |
@@ -74,7 +91,7 @@ This borrows the running server: expiry removes its route, **not** the server. F
 | `tunnel down hello` | Tear down a preview now |
 | `tunnel cleanup` | Remove expired previews; retry failures later |
 
-On macOS, a small user launchd job checks expiry every minute, even after your terminal closes. On other platforms, use `--ttl never` and run `tunnel down` yourself. Cleanup removes containers and networks but **keeps Compose volumes by default**. For disposable data, create the preview with `--disposable`; teardown will then remove its volumes too.
+On macOS, a small user launchd job checks expiry every minute, even after your terminal closes. On other platforms, use `--ttl never` and run `tunnel down` yourself. Cleanup removes containers, networks and built images but **keeps Compose volumes by default**; a later `up` of the same directory picks them up again, and `tunnel rm` or `tunnel prune` deletes them with the directory. For disposable data, create the preview with `--disposable`; teardown will then remove its volumes too.
 
 ## Network Setup and Troubleshooting
 

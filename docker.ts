@@ -93,8 +93,15 @@ export function projectResources(project: string) {
   return { containers: ids("ps", "-aq"), networks: ids("network", "ls", "-q"), volumes: ids("volume", "ls", "-q") };
 }
 
+// Images Compose built for the project, by reference: deleting a reference only untags an image
+// that another tag still uses.
+export function projectImages(project: string): string[] {
+  return sh("docker", ["image", "ls", "--filter", `label=com.docker.compose.project=${project}`, "--format", "{{.Repository}}:{{.Tag}}"])
+    .split("\n").filter((ref) => ref && !ref.includes("<none>"));
+}
+
 // Label-based rather than `compose down`, so it covers every profile and still works after the
-// worktree or its .env is gone.
+// worktree or its .env is gone. Images are rebuilt from the build cache by the next up.
 export function removeProject(project: string, { volumes }: { volumes: boolean }): void {
   const owned = projectResources(project);
   if (owned.containers.length) {
@@ -103,4 +110,28 @@ export function removeProject(project: string, { volumes }: { volumes: boolean }
   }
   if (owned.networks.length) sh("docker", ["network", "rm", ...owned.networks]);
   if (volumes && owned.volumes.length) sh("docker", ["volume", "rm", ...owned.volumes]);
+  // Best effort: another project's container may still run the same image.
+  const images = projectImages(project);
+  if (images.length) sh("docker", ["rmi", ...images], { quiet: true });
+}
+
+// Every Compose project that has containers, with the directory it was started from.
+export function composeProjects(): Map<string, string> {
+  const rows = sh("docker", ["ps", "-a", "--filter", "label=com.docker.compose.project", "--format",
+    '{{.Label "com.docker.compose.project"}}\t{{.Label "com.docker.compose.project.working_dir"}}']);
+  const projects = new Map<string, string>();
+  for (const row of rows.split("\n").filter(Boolean)) {
+    const [project, dir] = row.split("\t") as [string, string | undefined];
+    if (dir) projects.set(project, dir);
+  }
+  return projects;
+}
+
+// Compose's default project name for a directory.
+export const defaultProjectName = (dir: string) => dir.split("/").pop()!.toLowerCase().replace(/[^a-z0-9_-]/g, "");
+
+// Untagged images and week-old build cache are never needed again.
+export function pruneBuildLeftovers(): void {
+  sh("docker", ["image", "prune", "-f"]);
+  sh("docker", ["builder", "prune", "-f", "--filter", "until=168h"]);
 }
