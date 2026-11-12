@@ -1,13 +1,13 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="360" viewBox="0 0 1120 360" role="img" aria-labelledby="title desc">
-<title id="title">Preview it. Forget it.</title><desc id="desc">Tunnel starts your Compose services, routes a named URL through one shared proxy, and tears down the preview after a thirty-minute lease.</desc>
-<rect width="1120" height="360" fill="#101112"/>
-<g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
-<text x="40" y="51" fill="#a0a5aa" font-size="13" letter-spacing="3">LOCAL PREVIEWS / WITHOUT THE PILEUP</text>
-<text x="40" y="99" fill="#f1f3f5" font-size="32" font-weight="bold">Preview it. Forget it.</text>
-<g fill="#17191b" stroke="#3c4146"><rect x="40" y="135" width="308" height="145"/><rect x="406" y="135" width="308" height="145"/><rect x="772" y="135" width="308" height="145"/></g>
-<g fill="#67e8c0" font-size="13"><text x="62" y="167">01 / START</text><text x="428" y="167">02 / OPEN</text><text x="794" y="167">03 / EXPIRE</text></g>
-<g fill="#f1f3f5" font-size="19"><text x="62" y="204">tunnel up --build</text><text x="428" y="204">branch.your-domain</text><text x="794" y="204">30 minutes later</text></g>
-<g fill="#a0a5aa" font-size="13"><text x="62" y="241">Your Compose services</text><text x="428" y="241">One shared Caddy proxy</text><text x="794" y="241">Owned stack torn down</text></g>
-<g fill="none" stroke="#67e8c0" stroke-width="2"><path d="M356 207h40m-8-6 8 6-8 6"/><path d="M722 207h40m-8-6 8 6-8 6"/></g>
-<text x="40" y="322" fill="#a0a5aa" font-size="12">LAN / TAILSCALE · NOT A PUBLIC RELAY · KEEP DATA UNLESS EXPLICITLY DISPOSABLE</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="380" viewBox="0 0 1120 380" role="img" aria-labelledby="title desc">
+<title id="title">Preview it. Forget it.</title><desc id="desc">Tunnel creates a worktree for a branch, starts its Compose stack, gives it a named URL through one shared proxy, and removes everything when the worktree is deleted or the thirty-minute lease expires.</desc>
+<rect width="1120" height="380" rx="16" fill="#0f1113"/>
+<g font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif">
+<text x="40" y="76" fill="#f4f5f6" font-size="34" font-weight="700">Preview it. Forget it.</text>
+<text x="40" y="108" fill="#9aa1a8" font-size="16">A worktree, a running stack and a named URL for every branch, cleaned up when you're done.</text>
+<g fill="#181b1e" stroke="#2c3135"><rect x="40" y="144" width="230" height="156" rx="12"/><rect x="310" y="144" width="230" height="156" rx="12"/><rect x="580" y="144" width="230" height="156" rx="12"/><rect x="850" y="144" width="230" height="156" rx="12"/></g>
+<g fill="#67e8c0" font-size="12" font-weight="600" letter-spacing="1.5"><text x="62" y="180">1 · BRANCH</text><text x="332" y="180">2 · START</text><text x="602" y="180">3 · SHARE</text><text x="872" y="180">4 · CLEAN UP</text></g>
+<g fill="#f4f5f6" font-size="22" font-weight="600"><text x="62" y="218">tunnel new</text><text x="332" y="218">tunnel up</text><text x="602" y="218">A named URL</text><text x="872" y="218">tunnel rm</text></g>
+<g fill="#9aa1a8" font-size="14"><text x="62" y="250">Worktree with .env and</text><text x="62" y="270">node_modules linked</text><text x="332" y="250">Your Compose stack, no</text><text x="332" y="270">port or name collisions</text><text x="602" y="250">One shared proxy on your</text><text x="602" y="270">LAN or tailnet</text><text x="872" y="250">Or let the preview expire</text><text x="872" y="270">after 30 minutes</text></g>
+<g fill="none" stroke="#67e8c0" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M286 216l6 6-6 6"/><path d="M556 216l6 6-6 6"/><path d="M826 216l6 6-6 6"/></g>
+<text x="40" y="342" fill="#9aa1a8" font-size="13">LAN or Tailscale only · Not a public relay · Data is kept unless you ask for disposable</text>
 </g></svg>

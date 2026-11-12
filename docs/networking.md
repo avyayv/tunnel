@@ -48,6 +48,7 @@ Saved settings live in `~/.config/tunnel/config.json`. Environment values overri
 | `--bind` | `TUNNEL_PROXY_BIND` | `0.0.0.0` |
 | `--dns` | `TUNNEL_DNS` | `external`; `split` enables CoreDNS bootstrap |
 | `--state-dir` | `TUNNEL_STATE_DIR` | Config directory; holds routes and mappings |
+| `--worktrees` | `TUNNEL_WORKTREES` | `~/.worktrees`; where `tunnel new` puts worktrees |
 | — | `TUNNEL_CONFIG_DIR` | `~/.config/tunnel` |
 
 For example, `tunnel setup --bind 100.64.0.10` restricts new proxy listeners to that local interface. On macOS, ports a Compose preview publishes on all interfaces are rebound to `127.0.0.1` (the proxy still reaches them through `host.docker.internal`), and ports bound to a specific interface are left alone. On Linux, bridge containers can't reach the host's loopback, so app ports keep the Compose file's interfaces; restrict them with firewall rules. Some VM-backed runtimes can't bind host VPN interfaces; verify the runtime's behavior and use firewall controls where necessary.
