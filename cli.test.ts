@@ -105,12 +105,16 @@ function fixture() {
   const env = (extra: Record<string, string>) => ({
     ...process.env, HOME: root, PATH: `${bin}:${process.env.PATH}`, TUNNEL_CONFIG_DIR: config,
     TUNNEL_PROXY_PORT: "8000", TUNNEL_DOMAIN: "dev.example.com", TUNNEL_PROXY_IP: "100.64.0.2",
-    TUNNEL_STATE_DIR: "", TUNNEL_PROXY_BIND: "", TUNNEL_DNS: "", TUNNEL_PROBE_MS: "0",
+    TUNNEL_STATE_DIR: "", TUNNEL_PROXY_BIND: "", TUNNEL_DNS: "",
     SITES: sites, LOG: log, MARKER: join(root, "proxy-started"), PROXY_ENV: join(root, "proxy-env"), ...extra,
   });
   const command = (args: string[], cli = join(import.meta.dir, "cli.ts")) => [process.execPath, cli, ...args];
-  // Off macOS, finite leases are refused, so ordinary cases opt out of expiry explicitly.
-  const portable = (args: string[]) => !darwin && args[0] === "up" && !args.includes("--ttl") ? [...args, "--ttl", "never"] : args;
+  // Ordinary cases don't wait for apps to answer HTTP, and off macOS, where finite leases are
+  // refused, they opt out of expiry.
+  const portable = (args: string[]) => args[0] !== "up" ? args : ["up",
+    ...!args.includes("--wait") ? ["--wait", "0s"] : [],
+    ...!darwin && !args.includes("--ttl") ? ["--ttl", "never"] : [],
+    ...args.slice(1)];
   const mappingPath = join(config, "dev-proxy/mappings/review.json");
   const rows = () => existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean).map((row) => JSON.parse(row)) : [];
   return {
@@ -123,8 +127,8 @@ function fixture() {
     spawn: (args: string[]) => Bun.spawn(command(portable(args)), { cwd: app, env: env({}), stdout: "pipe", stderr: "pipe" }),
     calls: (): string[] => rows().map((row) => row.call),
     urlFor: (prefix: string): string | undefined => rows().find((row) => row.call.startsWith(prefix))?.url,
-    // Whether the fake Docker holds a resource of the project: c(ontainers), n(etworks), v(olumes).
-    docker: (project: string, kind: "c" | "n" | "v") => existsSync(`${log}.${project}.${kind}`),
+    // Whether the fake Docker holds a resource of the project: c(ontainers), n(etworks), v(olumes), i(mages).
+    docker: (project: string, kind: "c" | "n" | "v" | "i") => existsSync(`${log}.${project}.${kind}`),
     seedDocker: (project: string, kind: "c" | "n" | "v" | "i") => writeFileSync(`${log}.${project}.${kind}`, ""),
     // A Compose stack started by hand (not by tunnel) from `dir`.
     seedStack: (project: string, dir: string) => {
@@ -137,7 +141,15 @@ function fixture() {
       change(mapping);
       writeFileSync(mappingPath, JSON.stringify(mapping));
     },
-    close: () => rmSync(root, { recursive: true, force: true }),
+    close: () => {
+      // Stop any command a failed test left running.
+      const records = join(config, "dev-proxy/mappings");
+      for (const file of existsSync(records) ? readdirSync(records) : []) {
+        const { pid } = JSON.parse(readFileSync(join(records, file), "utf8"));
+        if (pid) try { process.kill(-pid, "SIGKILL"); } catch {}
+      }
+      rmSync(root, { recursive: true, force: true });
+    },
   };
 }
 
@@ -207,7 +219,7 @@ test("--target resolves an ephemeral host port after startup and is re-resolved 
   success(f.run(["up", "--build"], { TARGET_PORT: "55002" }));
   expect(f.calls()).toContain(`${base} up -d --build api`);
   expect(readFileSync(f.route, "utf8")).toContain("host.docker.internal:55002");
-  expect(f.mapping().port).toBe("55002");
+  expect(f.mapping().port).toBe(55002);
 }));
 
 test("pinned host ports are republished ephemerally and the default override file is loaded", withFixture((f) => {
@@ -329,11 +341,11 @@ test("failed restart keeps the record but stops routing to a possibly reassigned
   success(f.run(["up", "--name", "review", "--port", "8123"], { PORTS: "8123,9000" }));
   failure(f.run(["up", "--port", "9000"], { PORTS: "8123,9000", FAIL: "caddy reload" }));
   expect(readFileSync(f.route, "utf8")).toContain("host.docker.internal:8123");
-  expect(f.mapping().port).toBe("8123");
+  expect(f.mapping().port).toBe(8123);
   expect(f.docker("tunnel-review", "c")).toBe(true);
   failure(f.run(["up", "--port", "9000"], { PORTS: "8123,9000", FAIL: "up -d" }));
   expect(existsSync(f.route)).toBe(false);
-  expect(f.mapping().port).toBe("8123");
+  expect(f.mapping().port).toBe(8123);
 }));
 
 test("failed rollback keeps the mapping so down can finish later", withFixture((f) => {
@@ -387,7 +399,7 @@ test("unmanaged site files are never overwritten", withFixture((f) => {
 
 test("Compose array JSON format is supported", withFixture((f) => {
   success(f.run(["up", "--name", "review"], { ARRAY_PORTS: "1" }));
-  expect(f.mapping().port).toBe("8123");
+  expect(f.mapping().port).toBe(8123);
 }));
 
 test("borrowed local app: only its route is managed", withFixture((f) => {
@@ -476,6 +488,8 @@ test("invalid input is rejected without Docker or launchd side effects", withFix
     ["up", "--target", "api"], ["up", "--target", "api:http"], ["up", "--target", "api:0"], ["up", "--target", "api:65536"],
     ["up", "--port", "8123", "--target", "api:8080"], ["up", "--local", "--port", "5191", "--target", "api:8080"],
     ["up", "--local", "--port", "5191", "--profile", "x"], ["up", "--local"], ["up", "--local", "--port", "80", "--build"],
+    ["up", "--"], ["up", "--local", "--port", "80", "--", "serve"], ["up", "--build", "--", "serve"], ["up", "--target", "api:80", "--", "serve"],
+    ["up", "--url-env", "PORT", "--", "serve"], ["up", "--wait", "soon", "--", "serve"],
     ["up", "--unknown"], ["up", "one", "two"], ["up", "--name", "proxy"], ["up", "--name", "proxy-1a2b3c4d"],
     ["extend"], ["extend", "missing"], ["down", "missing"], ["cleanup", "extra"], ["cleanup", "--scheduled", "extra"], ["ls", "extra"],
     ["setup", "--ip", "bad"], ["setup", "--dns", "bad"], ["setup", "--bind", "bad"],
@@ -562,7 +576,6 @@ macOS("the reaper runs a private copy of tunnel that survives deleting the check
   const contents = readFileSync(join(agents, readdirSync(agents)[0]!), "utf8");
   const cli = /<string>([^<]+\/cli\.ts)<\/string><string>cleanup<\/string><string>--scheduled<\/string>/.exec(contents)![1]!;
   expect(cli.startsWith(join(f.config, "runtime"))).toBe(true);
-  expect(readdirSync(join(cli, "..")).sort()).toEqual(["Caddyfile", "Corefile", "cli.ts", "compose.yaml", "config.ts", "docker.ts", "lease.ts", "proxy.ts", "state.ts", "worktree.ts"]);
   expire(f);
   expect(success(f.runCli(cli, ["cleanup", "--scheduled"]))).toContain("review removed");
   expect(existsSync(f.mappingPath)).toBe(false);
@@ -642,6 +655,106 @@ otherOS("finite leases are refused off macOS before any side effect", withFixtur
   expect(f.mapping().expiresAt).toBeUndefined();
 }));
 
+// A command app: serves its port and environment over HTTP, on argv[2] if given (0 for any free
+// port), else on PORT, at BIND (default 127.0.0.1).
+const SERVE = `
+const server = Bun.serve({ hostname: process.env.BIND || "127.0.0.1", port: Number(process.argv[2] ?? process.env.PORT),
+  fetch: () => Response.json({ port: server.port, url: process.env.TUNNEL_URL, app: process.env.APP_PUBLIC_URL, agent: process.env.CLAUDECODE ?? null }) });
+console.log("serving on " + server.port);
+`;
+
+function commandApp(f: Fixture) {
+  writeFileSync(join(f.app, "serve.js"), SERVE);
+  return [process.execPath, join(f.app, "serve.js")];
+}
+
+const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+const served = async (port: number, host = "127.0.0.1") => (await fetch(`http://${host}:${port}/`)).json();
+
+test("a command runs in the background with PORT and its URL, logs its output, and down stops its process group", withFixture(async (f) => {
+  commandApp(f);
+  // One argument is a shell command line; the backgrounded sleep stays in the command's group.
+  const line = `sleep 300 & echo $! > sleep.pid; exec ${process.execPath} serve.js`;
+  // Agent markers make some dev servers detach from the process group (Astro 7), so they're dropped.
+  const out = success(f.run(["up", "--name", "review", "--wait", "20s", "--url-env", "APP_PUBLIC_URL", "--", line], { CLAUDECODE: "1" }));
+  const { port, pid } = f.mapping();
+  expect(out).toContain(`http://review.dev.example.com:8000 -> ${f.app} (port ${port})`);
+  expect(readFileSync(f.route, "utf8")).toContain(`host.docker.internal:${port}`);
+  expect(await served(port)).toEqual({ port, url: "http://review.dev.example.com:8000", app: "http://review.dev.example.com:8000", agent: null });
+  expect(success(f.run(["ls"]))).toContain(`(port ${port}, command;`);
+  expect(success(f.run(["logs", "review"]))).toContain(`serving on ${port}`);
+  const sleeper = Number(readFileSync(join(f.app, "sleep.pid"), "utf8"));
+  expect(alive(sleeper)).toBe(true);
+
+  success(f.run(["down", "review"]));
+  expect(alive(pid)).toBe(false);
+  expect(alive(sleeper)).toBe(false);
+  expect(existsSync(f.route)).toBe(false);
+  expect(existsSync(f.mappingPath)).toBe(false);
+}));
+
+test.skipIf(!Bun.which("lsof"))("a command that ignores PORT is routed to the port it serves, and repeat up restarts it", withFixture(async (f) => {
+  success(f.run(["up", "--name", "review", "--wait", "20s", "--", ...commandApp(f), "0"]));
+  const first = f.mapping();
+  expect(await served(first.port)).toMatchObject({ port: first.port });
+
+  success(f.run(["up", "--wait", "20s"]));
+  const second = f.mapping();
+  expect(second.pid).not.toBe(first.pid);
+  expect(alive(first.pid)).toBe(false);
+  expect(readFileSync(f.route, "utf8")).toContain(`host.docker.internal:${second.port}`);
+  expect(await served(second.port)).toMatchObject({ port: second.port });
+}));
+
+const lsof = test.skipIf(!Bun.which("lsof"));
+
+lsof("a command that serves only on IPv6 loopback is found there (Docusaurus, Vite on macOS)", withFixture(async (f) => {
+  const command = `BIND=::1 exec ${commandApp(f).join(" ")} 0`;
+  success(f.run(["up", "--name", "review", "--wait", "20s", "--", command]));
+  const { port } = f.mapping();
+  expect(await served(port, "[::1]")).toMatchObject({ port });
+}));
+
+// Regression: a Vite server on [::1]:5174 was routed to another Vite already on 127.0.0.1:5174.
+lsof("a command is not routed to a port another process also listens on", withFixture(async (f) => {
+  const other = Bun.spawn([...commandApp(f), "0"], { stdout: "pipe" });
+  try {
+    const { value } = await other.stdout.getReader().read();
+    const port = new TextDecoder().decode(value).trim().split(" ").pop()!;
+    expect(failure(f.run(["up", "--name", "review", "--wait", "20s", "--", `BIND=::1 exec ${commandApp(f).join(" ")} ${port}`])))
+      .toContain(`also listens on port ${port}`);
+    expect(existsSync(f.route)).toBe(false);
+    expect(existsSync(f.mappingPath)).toBe(false);
+  } finally { other.kill(); }
+}));
+
+test("a command that exits before serving HTTP is rolled back, and the error shows its output", withFixture((f) => {
+  expect(failure(f.run(["up", "--name", "review", "--wait", "20s", "--", "echo missing-config; exit 3"])))
+    .toMatch(/exited before serving HTTP[^]*missing-config/);
+  expect(existsSync(f.route)).toBe(false);
+  expect(existsSync(f.mappingPath)).toBe(false);
+}));
+
+test("a command is not started on a --port something else already listens on", withFixture(async (f) => {
+  const other = Bun.spawn([...commandApp(f), "0"], { stdout: "pipe" });
+  try {
+    const { value } = await other.stdout.getReader().read();
+    const port = new TextDecoder().decode(value).trim().split(" ").pop()!;
+    expect(failure(f.run(["up", "--name", "review", "--port", port, "--", ...commandApp(f)]))).toContain(`port ${port} is already in use`);
+    expect(existsSync(f.mappingPath)).toBe(false);
+  } finally { other.kill(); }
+}));
+
+test("a recorded pid that now belongs to another process is never signalled", withFixture((f) => {
+  success(f.run(["up", "--name", "review", "--wait", "20s", "--", ...commandApp(f)]));
+  const { pid } = f.mapping();
+  f.editMapping((m) => { m.pidStart = "Thu Jan  1 00:00:00 1970"; });
+  expect(success(f.run(["ls"]))).toContain("command, exited;");
+  success(f.run(["down", "review"]));
+  expect(alive(pid)).toBe(true);
+  process.kill(-pid, "SIGKILL");
+}));
+
 test("help and skill work without configuration or Docker", withFixture((f) => {
   mkdirSync(f.config, { recursive: true });
   writeFileSync(join(f.config, "config.json"), "invalid json");
@@ -690,6 +803,8 @@ test("rm removes a worktree with its previews, hand-started stacks and their dat
   success(f.run(["up", "--name", "review", path], r.env));
   success(f.run(["up", "--name", "kept", path], r.env));
   success(f.run(["down", "kept"], r.env));
+  success(f.run(["up", "--name", "server", "--wait", "20s", path, "--", ...commandApp(f)], r.env));
+  const server = JSON.parse(readFileSync(join(f.config, "dev-proxy/mappings/server.json"), "utf8")).pid;
   expect(f.docker("tunnel-kept", "v")).toBe(true);
   f.seedStack("feat", path);
   f.seedStack("elsewhere", f.app);
@@ -702,6 +817,7 @@ test("rm removes a worktree with its previews, hand-started stacks and their dat
   expect(result(f.run(["rm", path, "--force"], r.env))).toBe(f.app);
   expect(existsSync(path)).toBe(false);
   expect(existsSync(f.mappingPath)).toBe(false);
+  expect(alive(server)).toBe(false);
   for (const project of ["tunnel-review", "tunnel-kept", "feat"]) {
     for (const kind of ["c", "n", "v", "i"] as const) expect(f.docker(project, kind)).toBe(false);
   }

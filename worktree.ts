@@ -1,6 +1,6 @@
 import { existsSync, lstatSync, mkdirSync, readdirSync, rmSync, symlinkSync } from "node:fs";
 import { dirname, join, relative, sep } from "node:path";
-import { sh } from "./docker";
+import { sh } from "./sh";
 
 const git = (dir: string, args: readonly string[], quiet = false) => sh("git", ["-C", dir, ...args], { quiet });
 const hasRef = (dir: string, ref: string) => Bun.spawnSync(["git", "-C", dir, "show-ref", "--verify", "--quiet", ref]).exitCode === 0;

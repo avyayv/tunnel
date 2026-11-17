@@ -55,15 +55,17 @@ For example, `tunnel setup --bind 100.64.0.10` restricts new proxy listeners to 
 
 Older installations used `~/.selfbench` for state. To retain those routes, configure the old domain/IP and `--state-dir ~/.selfbench`. Nothing is migrated or deleted automatically.
 
-## Already-Running Server
+## Commands and Already-Running Servers
+
+The proxy runs in Docker and reaches apps on the host through `host.docker.internal`. Docker Desktop and OrbStack on macOS forward that to the Mac's loopback, so an app bound to `127.0.0.1` works; OrbStack also reaches apps bound only to IPv6 `::1` (common for Node dev servers, whose `localhost` resolves to `::1` on macOS). Because the proxy reaches the host by port alone, tunnel refuses a command whose port another process also listens on, on another address. On Linux, a host app bound to `127.0.0.1` generally isn't reachable from bridge containers: bind a Docker-reachable interface and restrict access with firewall rules. Framework host allowlists must allow the printed hostname.
+
+A command preview (`tunnel up -- COMMAND`) finds its port by asking every TCP port its process group listens on (per `lsof`), plus `PORT`, for an HTTP response, on the loopback address it listens on. Without `lsof`, only `PORT` or `--port` is checked. Commands run without coding-agent environment markers (`CLAUDECODE`, `AI_AGENT`, `CODEX_THREAD_ID`, `GEMINI_CLI` and similar), so tools don't detach into the background, out of reach of teardown. Its output goes to `<state-dir>/dev-proxy/logs/<name>.log`, which `tunnel logs` prints; teardown deletes it.
 
 ```sh
 tunnel up --local --name my-app --port 5173 /path/to/worktree
 ```
 
-The directory defaults to the current working directory and records source ownership, not a launch command. Without a Compose file, supplying `--port` also selects local mode. The server is never started, supervised, or stopped by tunnel; expiry or `down` removes only its route.
-
-Docker must reach the server via `host.docker.internal`. On Linux, a host server bound to `127.0.0.1` generally isn't reachable from bridge containers. Bind to a Docker-reachable interface and restrict access with firewall rules. Framework host allowlists must allow the printed hostname.
+routes a server something else started instead. The directory defaults to the current working directory and records source ownership, not a launch command. Without a Compose file, supplying `--port` alone also selects local mode. The server is never started, supervised, or stopped by tunnel; expiry or `down` removes only its route.
 
 ## Troubleshoot and Verify
 
@@ -75,11 +77,12 @@ tunnel doctor
 `ls` lists registrations, not guaranteed live apps. `doctor` checks Docker/Compose, proxy ownership, wildcard DNS, site targets, and HTTP responses. It exits nonzero on failures. HTTP 4xx is a failure; authenticated apps may need a manual check.
 
 - **Port conflict / wrong proxy:** a compatible Caddy publishes the configured proxy port and mounts this installation's `dev-proxy/sites`. Ownership mismatches fail explicitly. Inspect containers instead of overwriting another proxy.
-- **502:** confirm the app runs and Docker can reach its host port.
+- **502:** confirm the app runs and Docker can reach its host port. For a command preview, `tunnel ls` shows `exited` when its process group is gone; `tunnel logs NAME` shows why.
 - **DNS failure:** check IP, resolver policy, and split-DNS configuration. `curl --resolve <hostname>:<proxy-port>:<machine-IP> <full-URL>` diagnoses proxy routing, not normal DNS or remote reachability.
 - **Another device can't open the link:** check routes, tailnet permissions, and firewall rules. Local HTTP success doesn't prove remote reachability.
-- **OAuth:** configure the exact callback origin with your provider and follow its wildcard rules. Tunnel does not provision OAuth apps. Use `--url-env` with the variable your Compose app actually consumes before starting it.
-- **Multiple published ports:** without `--port` or `--target`, tunnel probes each published port with a GET (up to 30 seconds) and routes the only one answering HTTP; select `--target <service>:<container-port>` to choose explicitly, or `--port` for a known host port. Without `--port`, tunnel writes a generated override under the state directory that republishes fixed host ports on ephemeral ones and removes fixed `container_name`s and non-external volume and network names, so previews of one project don't collide. `--port` keeps the Compose file's fixed host ports, which can conflict across previews.
-- **Old image-built code:** use `--build`; registering a URL does not rebuild images.
+- **OAuth:** configure the exact callback origin with your provider and follow its wildcard rules. Tunnel does not provision OAuth apps. Use `--url-env` with the variable your app actually consumes before starting it.
+- **Multiple published ports:** without `--port` or `--target`, tunnel probes each published port with a GET (up to `--wait`, default 2 minutes) and routes the only one answering HTTP; select `--target <service>:<container-port>` to choose explicitly, or `--port` for a known host port. Without `--port`, tunnel writes a generated override under the state directory that republishes fixed host ports on ephemeral ones and removes fixed `container_name`s and non-external volume and network names, so previews of one project don't collide. `--port` keeps the Compose file's fixed host ports, which can conflict across previews.
+- **Old image-built code:** use `--build`; registering a URL does not rebuild images. Repeating `up` for a command preview restarts the command.
+- **Command never became ready:** `up` waits up to `--wait` (default 2m) for an HTTP answer and then stops the command and shows its last output. Raise `--wait` for slow first builds; pass `--port` if the app serves several HTTP ports.
 - **Interrupted command / stale lock:** lifecycle changes are serialized. If a command is killed, a lock under the config directory can remain; tunnel reports its path and owner PID. A reused PID may make it look busy instead; scheduled cleanup logs skipped checks. Confirm no tunnel operation is still running before removing that exact lock directory. Then run `tunnel down <name>` to finish a recorded partial startup. Automatic expiry is blocked until the stale lock is cleared.
 - **Cleanup diagnostics:** the macOS user job writes to `<state-dir>/cleanup.log`; its plist lives under `~/Library/LaunchAgents/dev.tunnel.cleanup.<state-hash>.plist`. It stays installed when no previews remain. A content-addressed copy of the cleanup runtime lives under `<state-dir>/runtime`, independent of the source checkout. To uninstall, identify the exact label in that plist, run `launchctl bootout gui/$(id -u)/<label>`, then remove that exact plist. Don't remove another state directory's job.

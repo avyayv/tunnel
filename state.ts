@@ -1,51 +1,78 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { configDir, type Config } from "./config";
+import { configDir, origin, stateRoot, type Config } from "./config";
 
-export interface Mapping {
+// How a preview's app runs: a Compose stack, a command tunnel started, or an app someone else
+// started (local), of which tunnel manages only the route.
+export type Mode = "compose" | "command" | "local";
+
+export interface Preview {
   readonly name: string;
   readonly dir: string;
-  readonly port: string; // Empty while a new preview is starting.
-  readonly mode?: "compose" | "local"; // Absent in old mappings, which are all Compose.
-  readonly project?: string;
-  readonly url?: string;
+  readonly mode: Mode;
+  readonly url: string; // Fixed at creation, so a later configuration change cannot orphan the route.
+  readonly port?: number; // The routed host port; absent while a new preview starts.
+  readonly fixedPort?: number; // From --port; a repeated up keeps it.
   readonly expiresAt?: number;
-  readonly disposable?: boolean;
-  readonly services?: string[];
-  readonly profiles?: string[];
-  readonly urlEnv?: string[];
+  readonly urlEnv: readonly string[];
+  // Compose
+  readonly project?: string;
+  readonly services: readonly string[];
+  readonly profiles: readonly string[];
   readonly target?: string; // SERVICE:CONTAINER_PORT, re-resolved on every up.
-  readonly fixedPort?: string; // Compose host port chosen with --port, reused by a repeated up.
+  readonly disposable: boolean;
+  // Command
+  readonly command?: readonly string[];
+  readonly pid?: number; // Leader of the command's process group.
+  readonly pidStart?: string; // The leader's start time, so a reused pid is never signalled.
 }
 
-export const sitesDir = (config: Config) => join(config.stateDir, "dev-proxy", "sites");
-const mappingsDir = (config: Config) => join(config.stateDir, "dev-proxy", "mappings");
+const previewsDir = (config: Config) => join(stateRoot(config), "mappings");
 
-export function readMappings(config: Config): Mapping[] {
-  const dir = mappingsDir(config);
+// Records written by older versions lack fields and store ports as strings.
+function normalize(config: Config, raw: Record<string, any>): Preview {
+  const port = (value: unknown) => (value === undefined || value === "" ? undefined : Number(value));
+  const mode: Mode = raw.mode ?? "compose";
+  return {
+    ...raw,
+    name: raw.name,
+    dir: raw.dir,
+    mode,
+    url: raw.url || origin(config, raw.name),
+    port: port(raw.port),
+    fixedPort: port(raw.fixedPort ?? (mode === "local" ? raw.port : undefined)),
+    urlEnv: raw.urlEnv ?? [],
+    services: raw.services ?? [],
+    profiles: raw.profiles ?? [],
+    disposable: !!raw.disposable,
+  };
+}
+
+export function readPreviews(config: Config): Preview[] {
+  const dir = previewsDir(config);
   if (!existsSync(dir)) return [];
   return readdirSync(dir).filter((file) => file.endsWith(".json")).map((file) => {
-    try { return JSON.parse(readFileSync(join(dir, file), "utf8")) as Mapping; }
-    catch (error) { throw new Error(`unreadable mapping ${join(dir, file)}: ${(error as Error).message}`); }
+    try { return normalize(config, JSON.parse(readFileSync(join(dir, file), "utf8"))); }
+    catch (error) { throw new Error(`unreadable preview record ${join(dir, file)}: ${(error as Error).message}`); }
   });
 }
 
-export function saveMapping(config: Config, mapping: Mapping): void {
-  writeAtomic(join(mappingsDir(config), `${mapping.name}.json`), `${JSON.stringify(mapping, null, 2)}\n`);
+export function savePreview(config: Config, preview: Preview): void {
+  writeAtomic(join(previewsDir(config), `${preview.name}.json`), `${JSON.stringify(preview, null, 2)}\n`);
 }
 
-export function deleteMapping(config: Config, name: string): void {
-  rmSync(join(mappingsDir(config), `${name}.json`), { force: true });
+export function deletePreview(config: Config, name: string): void {
+  rmSync(join(previewsDir(config), `${name}.json`), { force: true });
 }
 
-// Volumes a torn-down preview kept, with the directory it served, so a later up there can adopt
-// them and removing that directory (tunnel rm or prune) can delete them.
+// Volumes a torn-down Compose preview kept, with the directory it served, so a later up there can
+// adopt them and removing that directory (tunnel rm or prune) can delete them.
 export interface Retained {
   readonly project: string;
   readonly dir: string;
 }
 
-const retainedDir = (config: Config) => join(config.stateDir, "dev-proxy", "retained");
+const retainedDir = (config: Config) => join(stateRoot(config), "retained");
 
 export function readRetained(config: Config): Retained[] {
   const dir = retainedDir(config);
@@ -98,8 +125,7 @@ export function acquireLock({ wait }: { wait: boolean }): (() => void) | undefin
     if (!wait) {
       // Logged every time, so a lock held far too long (for example by a reused pid) is visible.
       const since = statSync(path, { throwIfNoEntry: false })?.mtimeMs ?? Date.now();
-      const minutes = Math.round((Date.now() - since) / 60_000);
-      console.error(`tunnel: skipped; pid ${owner} has held ${path} for ${minutes} min`);
+      console.error(`tunnel: skipped; pid ${owner} has held ${path} for ${Math.round((Date.now() - since) / 60_000)} min`);
       return undefined;
     }
     if (Date.now() > deadline) throw new Error(`timed out waiting for tunnel operation (pid ${owner}) holding ${path}`);

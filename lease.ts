@@ -1,23 +1,16 @@
+// Leases: previews expire unless renewed, enforced by a per-user launchd job on macOS.
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { configDir, type Config } from "./config";
-import { sh } from "./docker";
+import { configDir, parseDuration, type Config } from "./config";
+import { sh } from "./sh";
 import { writeAtomic } from "./state";
 
 export const DEFAULT_TTL = 30 * 60_000;
 
-// Everything `tunnel cleanup` loads at runtime, plus the proxy files next to it.
-const RUNTIME_FILES = ["cli.ts", "config.ts", "docker.ts", "lease.ts", "proxy.ts", "state.ts", "worktree.ts", "compose.yaml", "Caddyfile", "Corefile"];
-
-export function parseTTL(value: string): number {
-  if (value === "never") return 0;
-  const match = /^(\d+)(m|h)$/.exec(value);
-  const ms = match ? Number(match[1]) * (match[2] === "h" ? 3_600_000 : 60_000) : 0;
-  if (!Number.isSafeInteger(ms) || ms <= 0 || ms > 7 * 86_400_000) throw new Error("TTL must be 1m–168h, or never");
-  return ms;
-}
+// Milliseconds, or 0 for "never".
+export const parseTTL = (value: string) => value === "never" ? 0 : parseDuration(value, "TTL (use 1m–168h, or never)", { min: 60_000, max: 168 * 3_600_000 });
 
 export function requireExpirySupport(): void {
   if (process.platform !== "darwin") {
@@ -26,7 +19,7 @@ export function requireExpirySupport(): void {
 }
 
 // One per-user job per state directory runs `tunnel cleanup --scheduled` every minute and at login,
-// with this configuration baked in. It stays loaded; ticks with nothing expired are cheap no-ops.
+// with this configuration baked in. It stays loaded; ticks with nothing to do are cheap no-ops.
 export function installReaper(config: Config): void {
   const label = `dev.tunnel.cleanup.${createHash("sha256").update(config.stateDir).digest("hex").slice(0, 8)}`;
   const domain = `gui/${process.getuid!()}`;
@@ -47,18 +40,18 @@ export function installReaper(config: Config): void {
     if (process.env[key]) env[key] = process.env[key]!;
   }
   const log = join(config.stateDir, "cleanup.log");
-  const plistString = (value: string) => `<string>${value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")}</string>`;
+  const string = (value: string) => `<string>${value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")}</string>`;
   const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key>${plistString(label)}
+  <key>Label</key>${string(label)}
   <key>ProgramArguments</key>
-  <array>${[process.execPath, join(runtime, "cli.ts"), "cleanup", "--scheduled"].map(plistString).join("")}</array>
+  <array>${[process.execPath, join(runtime, "cli.ts"), "cleanup", "--scheduled"].map(string).join("")}</array>
   <key>EnvironmentVariables</key>
-  <dict>${Object.entries(env).map(([key, value]) => `<key>${key}</key>${plistString(value)}`).join("")}</dict>
-  <key>StandardOutPath</key>${plistString(log)}
-  <key>StandardErrorPath</key>${plistString(log)}
+  <dict>${Object.entries(env).map(([key, value]) => `<key>${key}</key>${string(value)}`).join("")}</dict>
+  <key>StandardOutPath</key>${string(log)}
+  <key>StandardErrorPath</key>${string(log)}
   <key>StartInterval</key><integer>60</integer>
   <key>RunAtLoad</key><true/>
 </dict>
@@ -80,10 +73,13 @@ export function installReaper(config: Config): void {
   }
 }
 
-// Copies the job's code into the state directory, so deleting the checkout that installed it
-// cannot break expiry. Versions are content-addressed and appear atomically.
+// Copies the job's code (every module, plus the proxy files next to them) into the state
+// directory, so deleting the checkout that installed it cannot break expiry. Versions are
+// content-addressed and appear atomically.
 function installRuntime(stateDir: string): string {
-  const files = RUNTIME_FILES.map((name) => [name, readFileSync(join(import.meta.dir, name))] as const);
+  const names = readdirSync(import.meta.dir).filter((name) =>
+    (name.endsWith(".ts") && !name.endsWith(".test.ts")) || ["compose.yaml", "Caddyfile", "Corefile"].includes(name)).sort();
+  const files = names.map((name) => [name, readFileSync(join(import.meta.dir, name))] as const);
   const hash = createHash("sha256");
   for (const [name, data] of files) hash.update(name).update("\0").update(data).update("\0");
   const dir = join(stateDir, "runtime", hash.digest("hex").slice(0, 12));
